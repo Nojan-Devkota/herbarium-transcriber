@@ -6,6 +6,7 @@ while the API reads.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -27,9 +28,16 @@ def _configure_sqlite(dbapi_conn, _record) -> None:
     cur.close()
 
 
+_engine_lock = threading.Lock()
+
+
 def get_engine() -> Engine:
     global _engine
-    if _engine is None:
+    if _engine is not None:
+        return _engine
+    with _engine_lock:  # the API threads and the worker may race to create it
+        if _engine is not None:
+            return _engine
         settings = get_settings()
         _engine = create_engine(
             f"sqlite:///{settings.db_path}",

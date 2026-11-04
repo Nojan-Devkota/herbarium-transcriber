@@ -111,8 +111,22 @@ export interface Stats {
   edit_rate_by_confidence: Record<string, number | null>;
 }
 
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number, // 0 = network error
+  ) {
+    super(message);
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const resp = await fetch(path, init);
+  let resp: Response;
+  try {
+    resp = await fetch(path, init);
+  } catch {
+    throw new ApiError("cannot reach the server", 0);
+  }
   if (!resp.ok) {
     let detail = resp.statusText;
     try {
@@ -121,9 +135,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       /* not JSON */
     }
-    throw new Error(`${resp.status}: ${detail}`);
+    throw new ApiError(`${resp.status}: ${detail}`, resp.status);
   }
-  return resp.json() as Promise<T>;
+  try {
+    return (await resp.json()) as T;
+  } catch {
+    throw new ApiError("server returned an unexpected response", resp.status);
+  }
 }
 
 const json = (body: unknown): RequestInit => ({
@@ -144,12 +162,13 @@ export const api = {
   },
   gbifBatch: (body: { dataset_key?: string; scientific_name?: string; year?: string; limit: number }) =>
     request<GbifBatchResult>("/batches/gbif", { method: "POST", ...json(body) }),
-  reprocess: (id: number, ablation: Ablation = "full") =>
+  reprocess: (id: number, ablation: Ablation = "sam+verify") =>
     request<SheetSummary>(`/sheets/${id}/process`, { method: "POST", ...json({ ablation }) }),
   reviewField: (id: number, action: "accept" | "edit", value?: string) =>
     request<Field>(`/fields/${id}`, { method: "PATCH", ...json({ action, value }) }),
   stats: () => request<Stats>("/stats"),
-  imageUrl: (id: number) => `/sheets/${id}/image`,
+  /** thumb ≈ 480 px, view ≈ 1600 px (what the UI shows); full is the original scan (several MB). */
+  imageUrl: (id: number, size: "thumb" | "view" | "full" = "view") => `/sheets/${id}/image?size=${size}`,
   cropUrl: (regionId: number) => `/regions/${regionId}/crop`,
   exportUrl: (reviewedOnly = false) => `/export.csv${reviewedOnly ? "?reviewed_only=true" : ""}`,
 };

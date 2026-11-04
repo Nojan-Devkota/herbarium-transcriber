@@ -134,3 +134,20 @@ def test_country_lookup(written, code):
 def test_country_lookup_unknown():
     assert country_lookup("Atlantis Minor") is None
     assert country_lookup("") is None
+
+
+@pytest.mark.parametrize("written, code", [("Norwey", "NO"), ("Swedn", "SE"), ("Grmany", "DE")])
+def test_country_lookup_tolerates_small_misreads(written, code):
+    assert country_lookup(written)["code"] == code
+
+
+@pytest.mark.parametrize("garbage", ["Xqzzv", "Sor-Trondelag", "Leg.", "Herb"])
+def test_country_lookup_rejects_garbage_and_subdivisions(garbage):
+    assert country_lookup(garbage) is None
+
+
+def test_sam_parser_accepts_float_coordinates():
+    from app.clients.meta_api import parse_sam_output
+
+    dets, w, h = parse_sam_output("<0f>0<|box;x1=10.0;y1=20.5;x2=30;y2=40;w=1024.0;h=768|>")
+    assert (dets[0].x1, dets[0].y1, w, h) == (10, 20, 1024, 768)

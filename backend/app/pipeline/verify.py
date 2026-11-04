@@ -129,8 +129,11 @@ class Verifier:
             self.ctx.release_db()
             try:
                 match = self.ctx.gbif.name_match(f.value or "")
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, ValueError) as exc:  # ValueError: non-JSON reply
+                log.warning("GBIF name match unavailable for field %s: %s", f.id, exc)
                 trace.add("gbif_name_match", {"name": f.value}, {"error": f"GBIF unavailable: {type(exc).__name__}"}, None)
+                # The check never ran: never let such a field be auto-accepted
+                _set_evidence(f, verification_unavailable=True)
                 return
             passed = name_check_passed(match, self.s.gbif_min_match_confidence)
             trace.add("gbif_name_match", {"name": f.value}, match, passed)
@@ -216,8 +219,9 @@ class Verifier:
         self.ctx.release_db()
         try:
             result = self.ctx.geocoder.geocode(loc.value or "", state.value if state else None, cc)  # type: ignore[union-attr]
-        except httpx.HTTPError as exc:
-            trace.add("geocode", {"locality": loc.value}, {"error": type(exc).__name__}, None)
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("geocoding unavailable for field %s: %s", loc.id, exc)
+            trace.add("geocode", {"locality": loc.value}, {"error": f"{type(exc).__name__}: {exc}"[:200]}, None)
             return
         trace.add("geocode", {"locality": loc.value, "state": state.value if state else None, "countryCode": cc},
                   result or {"error": "no match"}, result is not None)  # fmt: skip

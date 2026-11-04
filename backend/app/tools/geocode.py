@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import hashlib
 import math
+import threading
+import time
 import unicodedata
 from typing import Any
 
 import httpx
 import pycountry
+from rapidfuzz import fuzz, process
 
 from app.cache import Cache
 
@@ -40,6 +43,12 @@ def _fold(s: str) -> str:
     return " ".join(s.lower().replace(":", " ").split()).strip(" .,;")
 
 
+_COUNTRY_NAMES: dict[str, str] = {}
+for _c in pycountry.countries:
+    for _n in {_c.name, getattr(_c, "common_name", _c.name), getattr(_c, "official_name", _c.name)}:
+        _COUNTRY_NAMES[_fold(_n)] = _c.alpha_2
+
+
 def country_lookup(name: str | None) -> dict[str, Any] | None:
     """Return {'code', 'name'} for a country as written, or None if unknown."""
     if not name or not name.strip():
@@ -51,14 +60,19 @@ def country_lookup(name: str | None) -> dict[str, Any] | None:
         try:
             country = pycountry.countries.lookup(name.strip())
         except LookupError:
-            try:
-                matches = pycountry.countries.search_fuzzy(folded)
-                country = matches[0] if matches else None
-            except LookupError:
-                country = None
+            country = _closest_country(folded)
     if country is None:
         return None
     return {"code": country.alpha_2, "name": getattr(country, "common_name", None) or country.name}
+
+
+def _closest_country(folded: str) -> Any:
+    """Close spelling match against country names only (pycountry's search_fuzzy also matches
+    subdivisions and accepts OCR garbage as a country)."""
+    if len(folded) < 5:
+        return None
+    best = process.extractOne(folded, list(_COUNTRY_NAMES), scorer=fuzz.ratio, score_cutoff=80)
+    return pycountry.countries.get(alpha_2=_COUNTRY_NAMES[best[0]]) if best else None
 
 
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -70,9 +84,20 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 class Geocoder:
+    MIN_INTERVAL_S = 1.0  # Nominatim usage policy: at most one request per second
+
     def __init__(self, user_agent: str, http: httpx.Client | None = None, cache: Cache | None = None):
         self.http = http or httpx.Client(timeout=20.0, headers={"User-Agent": user_agent})
         self.cache = cache
+        self._throttle = threading.Lock()
+        self._last = 0.0
+
+    def _wait_turn(self) -> None:
+        with self._throttle:
+            delay = self.MIN_INTERVAL_S - (time.monotonic() - self._last)
+            if delay > 0:
+                time.sleep(delay)
+            self._last = time.monotonic()
 
     def geocode(self, locality: str, state: str | None = None, country_code: str | None = None) -> dict[str, Any] | None:
         query = ", ".join(p for p in (locality, state) if p)
@@ -83,6 +108,7 @@ class Geocoder:
         params = {"q": query, "format": "jsonv2", "limit": 1}
         if country_code:
             params["countrycodes"] = country_code.lower()
+        self._wait_turn()
         resp = self.http.get("https://nominatim.openstreetmap.org/search", params=params)
         resp.raise_for_status()
         hits = resp.json()
@@ -102,3 +128,16 @@ class Geocoder:
         if self.cache:
             self.cache.set("geocode", hkey, {"result": result})
         return result
+
+
+_shared_geocoders: dict[tuple[str, str], Geocoder] = {}
+_geo_lock = threading.Lock()
+
+
+def shared_geocoder(user_agent: str, cache: Cache | None) -> Geocoder:
+    """One geocoder per process so the 1 request/second throttle holds across sheets."""
+    key = (user_agent, str(cache.root) if cache else "")
+    with _geo_lock:
+        if key not in _shared_geocoders:
+            _shared_geocoders[key] = Geocoder(user_agent, cache=cache)
+        return _shared_geocoders[key]

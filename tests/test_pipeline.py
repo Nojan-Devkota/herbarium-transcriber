@@ -154,8 +154,18 @@ def test_whole_sheet_ablation_skips_sam(session, settings, sheet_id):
     assert tools == {"grounding"}
 
 
+def test_second_reading_is_opt_in(session, settings, sheet_id):
+    client = MockClient()
+    process_sheet(sheet_id, client=client, gbif=gbif_offline(settings))
+    assert ("spark", "transcriptout") in client.calls
+    pass2 = session.exec(select(Transcript).where(Transcript.sheet_id == sheet_id, Transcript.pass_no == 2)).all()
+    assert pass2 == []  # default pipeline makes no second-reading calls
+    f = fields_by_term(session, sheet_id)["locality"]
+    assert "agreement" not in f.evidence and f.confidence_level == "medium" and f.status.value == "flagged"
+
+
 def test_selective_second_pass_only_for_unverified_fields(session, settings, sheet_id):
-    process_sheet(sheet_id, client=MockClient(), gbif=gbif_offline(settings))
+    process_sheet(sheet_id, client=MockClient(), options=RunOptions(use_second_pass=True), gbif=gbif_offline(settings))
     pass2 = session.exec(select(Transcript).where(Transcript.sheet_id == sheet_id, Transcript.pass_no == 2)).all()
     assert pass2  # free-text fields (locality, recordedBy) need a second reading
     f = fields_by_term(session, sheet_id)["locality"]
@@ -180,7 +190,7 @@ def test_cached_calls_keep_nominal_cost(session, settings, sheet_id):
         return raw, usage
 
     priced.complete_json = with_cost
-    first = process_sheet(sheet_id, client=priced, gbif=gbif_offline(settings))
+    first = process_sheet(sheet_id, client=priced, gbif=gbif_offline(settings))  # default options
     second = process_sheet(sheet_id, client=MockClient(), gbif=gbif_offline(settings))
     assert first.cost_usd > 0 and second.cost_usd == 0
     calls = session.exec(select(ModelCall).where(ModelCall.sheet_id == sheet_id)).all()
@@ -191,10 +201,16 @@ def test_no_write_lock_is_held_during_model_calls(session, settings, sheet_id):
     """Regression: concurrent eval workers hit 'database is locked' because a session
     held a write transaction open across slow model calls."""
     import sqlite3
+    import threading
 
     violations = []
+    probe_lock = threading.Lock()  # concurrent model calls must not trip over each other's probes
 
     def assert_db_writable():
+        with probe_lock:
+            _probe()
+
+    def _probe():
         con = sqlite3.connect(settings.db_path, timeout=0)
         try:
             con.execute("BEGIN IMMEDIATE")
@@ -216,6 +232,98 @@ def test_no_write_lock_is_held_during_model_calls(session, settings, sheet_id):
     gbif = gbif_offline(settings, match_type="NONE")  # forces re-reads, the path that held locks
     original = gbif.name_match
     gbif.name_match = lambda *a, **k: (assert_db_writable(), original(*a, **k))[1]
-    sheet = process_sheet(sheet_id, client=LockCheckingClient(), gbif=gbif)
+    sheet = process_sheet(sheet_id, client=LockCheckingClient(), options=RunOptions(use_second_pass=True), gbif=gbif)
     assert sheet.status == SheetStatus.done
     assert violations == []
+
+
+def test_sam_concepts_run_concurrently(session, settings, sheet_id):
+    import threading
+    import time
+
+    lock = threading.Lock()
+    state = {"now": 0, "peak": 0}
+
+    class SlowSam(MockClient):
+        def segment(self, image_jpeg, concept):
+            with lock:
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+            time.sleep(0.05)
+            with lock:
+                state["now"] -= 1
+            return super().segment(image_jpeg, concept)
+
+    sheet = process_sheet(sheet_id, client=SlowSam(), gbif=gbif_offline(settings))
+    assert sheet.status == SheetStatus.done
+    assert state["peak"] > 1
+    calls = session.exec(select(ModelCall).where(ModelCall.sheet_id == sheet_id, ModelCall.stage == "segment")).all()
+    assert len(calls) == 6  # every concept still logged exactly once
+
+
+def test_cost_of_finished_calls_is_kept_when_a_sibling_call_fails(session, settings, sheet_id):
+    from app.pipeline.context import CallRequest, PipelineContext
+    from app.models import Sheet
+    from app.prompts import load_prompt
+    from app.schemas.transcript import TranscriptOut
+
+    class HalfBroken(MockClient):
+        def complete_json(self, prompt, *args, **kwargs):
+            if "BOOM" in prompt:
+                raise RuntimeError("API down")
+            raw, usage = super().complete_json(prompt, *args, **kwargs)
+            usage.cost_usd = 0.02
+            return raw, usage
+
+    from tests.conftest import make_sheet_jpeg
+
+    sheet = session.get(Sheet, sheet_id)
+    ctx = PipelineContext(session, sheet, HalfBroken(), settings)
+    p = load_prompt("transcribe")
+    img = make_sheet_jpeg(200, 100)
+    reqs = [CallRequest("transcribe1", p, "ok", [img], TranscriptOut, "low", ("a",)),
+            CallRequest("transcribe1", p, "BOOM", [img], TranscriptOut, "low", ("b",))]  # fmt: skip
+    with pytest.raises(RuntimeError):
+        ctx.structured_many(reqs)
+    session.commit()
+    calls = session.exec(select(ModelCall).where(ModelCall.sheet_id == sheet_id)).all()
+    assert [c.cost_usd for c in calls] == [0.02]
+
+
+def test_stale_cache_entry_is_a_miss(session, settings, sheet_id):
+    process_sheet(sheet_id, client=MockClient(), gbif=gbif_offline(settings))
+    # Corrupt every cached Spark entry's shape (e.g. written by an older schema)
+    import json
+
+    for path in settings.cache_dir.rglob("*.json"):
+        if "transcribe1" in path.parts:
+            path.write_text(json.dumps({"data": {"unexpected": 1}, "usage": {"model": "x"}}))
+    client = MockClient()
+    sheet = process_sheet(sheet_id, client=client, gbif=gbif_offline(settings))
+    assert sheet.status == SheetStatus.done
+    assert ("spark", "transcriptout") in client.calls  # re-fetched instead of crashing
+
+
+def test_gbif_outage_flags_the_name_instead_of_passing_it(session, settings, sheet_id):
+    def down(request):
+        raise httpx.ConnectError("GBIF down")
+
+    gbif = GbifClient(http=httpx.Client(transport=httpx.MockTransport(down)), cache=Cache(settings.cache_dir / "down"))
+    sheet = process_sheet(sheet_id, client=MockClient(), gbif=gbif)
+    assert sheet.status == SheetStatus.done
+    f = fields_by_term(session, sheet_id)["scientificName"]
+    assert f.evidence["verification_unavailable"] is True
+    assert f.status.value == "flagged" and f.confidence_level != "high"
+
+
+def test_failed_sheet_keeps_cost_of_calls_already_made(session, settings, sheet_id):
+    class FailsAtInterpret(MockClient):
+        def complete_json(self, prompt, images, schema, schema_name, effort):
+            if schema_name == "interpretout":
+                raise RuntimeError("API down")
+            raw, usage = super().complete_json(prompt, images, schema, schema_name, effort)
+            usage.cost_usd = 0.01
+            return raw, usage
+
+    sheet = process_sheet(sheet_id, client=FailsAtInterpret(), gbif=gbif_offline(settings))
+    assert sheet.status == SheetStatus.error and sheet.cost_usd > 0  # transcription was paid for

@@ -56,7 +56,10 @@ def test_ingest_applies_exif_rotation(session):
     assert (sheet.width, sheet.height) == (200, 300)
 
 
-def test_gbif_batch_filters_licence_and_skips_broken_media(session, settings):
+def test_gbif_batch_filters_licence_and_skips_broken_media(session, settings, monkeypatch):
+    from app.pipeline import ingest
+
+    monkeypatch.setattr(ingest, "_resolve_ips", lambda host: ["93.184.216.34"])  # fake hosts resolve publicly
     img = make_sheet_jpeg(200, 300)
 
     def handler(request: httpx.Request):
@@ -152,3 +155,44 @@ def test_label_and_slip_on_same_box_is_a_label():
     label = Box(RegionKind.label, "label", "sam", 105, 102, 498, 398, 0.70)
     kept = dedupe_boxes([slip, label], 1000, 1500)
     assert len(kept) == 1 and kept[0].kind == RegionKind.label and kept[0].score == 0.93
+
+
+@pytest.mark.parametrize(
+    "url, ips",
+    [
+        ("http://127.0.0.1:8000/sheets", ["127.0.0.1"]),
+        ("http://169.254.169.254/latest/meta-data/", ["169.254.169.254"]),
+        ("http://intranet.local/x.jpg", ["10.0.0.5"]),
+        ("http://[::1]/x.jpg", ["::1"]),
+        ("file:///etc/passwd", ["93.184.216.34"]),
+        ("ftp://example.org/x.jpg", ["93.184.216.34"]),
+    ],
+)
+def test_ssrf_guard_blocks_non_public_targets(monkeypatch, url, ips):
+    from app.pipeline import ingest
+
+    monkeypatch.setattr(ingest, "_resolve_ips", lambda host: ips)
+    with pytest.raises(ingest.UnsafeURLError):
+        ingest.assert_public_url(url)
+
+
+def test_ssrf_guard_rechecks_every_redirect(monkeypatch):
+    from app.pipeline import ingest
+
+    monkeypatch.setattr(ingest, "_resolve_ips", lambda host: ["10.1.2.3"] if host == "internal" else ["93.184.216.34"])
+    hits = []
+
+    def handler(request: httpx.Request):
+        hits.append(request.url.host)
+        return httpx.Response(302, headers={"location": "http://internal/secret"})
+
+    http = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(ingest.UnsafeURLError):
+        ingest.download_image(http, "https://public.example/img.jpg")
+    assert hits == ["public.example"]  # the internal host was never contacted
+
+
+def test_oversized_and_truncated_images_are_clean_errors(session):
+    good = make_sheet_jpeg(300, 300)
+    with pytest.raises(ValueError, match="not a readable image"):
+        ingest_image(session, good[: len(good) // 3])

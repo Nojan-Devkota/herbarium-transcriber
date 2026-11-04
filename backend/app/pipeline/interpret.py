@@ -8,6 +8,7 @@ transcript to get a character span (for the UI highlight) and a grounding score
 
 from __future__ import annotations
 
+import logging
 import re
 
 from rapidfuzz import fuzz
@@ -15,7 +16,9 @@ from rapidfuzz import fuzz
 from app.models import Field, FieldStatus, Region, RegionKind, Transcript
 from app.pipeline.context import CallRequest, PipelineContext
 from app.prompts import load_prompt
-from app.schemas.darwin_core import LABEL_TERMS, InterpretOut
+from app.schemas.darwin_core import LABEL_TERMS, InterpretedField, InterpretOut
+
+log = logging.getLogger(__name__)
 
 # For these terms a later determination slip supersedes the main label
 IDENTIFICATION_TERMS = {"scientificName", "identifiedBy", "dateIdentified", "family"}
@@ -68,11 +71,15 @@ def interpret_fields(ctx: PipelineContext, regions: list[Region], transcripts: d
     )  # fmt: skip
 
     by_number = {n: (region, t) for n, region, t in numbered}
-    candidates: dict[str, list] = {}
+    candidates: dict[str, list[InterpretedField]] = {}
+    dropped = 0
     for f in out.fields:
         if f.region not in by_number or not f.value.strip():
+            dropped += 1  # unknown transcript number (hallucinated region) or empty value
             continue
         candidates.setdefault(f.term, []).append(f)
+    if dropped:
+        log.warning("sheet %s: dropped %d interpreted field(s) with unknown region or empty value", ctx.sheet_id, dropped)
 
     fields: list[Field] = []
     for term in LABEL_TERMS:  # export order
@@ -107,7 +114,7 @@ def interpret_fields(ctx: PipelineContext, regions: list[Region], transcripts: d
     return fields
 
 
-def _choose(term: str, cands: list, by_number: dict) -> object:
+def _choose(term: str, cands: list[InterpretedField], by_number: dict[int, tuple[Region, Transcript]]) -> InterpretedField:
     if len(cands) == 1:
         return cands[0]
     if term in IDENTIFICATION_TERMS:

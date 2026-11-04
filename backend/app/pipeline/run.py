@@ -82,9 +82,12 @@ def process_sheet(
             sheet.status, sheet.stage = SheetStatus.done, None
         except Exception as exc:  # a failed sheet must not take the worker down
             log.exception("sheet %s failed", sheet_id)
-            session.rollback()
+            try:
+                session.commit()  # keep the ModelCall rows of calls that were already paid for
+            except Exception:  # noqa: BLE001 - the session itself is broken
+                session.rollback()
             sheet = session.get(Sheet, sheet_id)
-            sheet.status = SheetStatus.error
+            sheet.status, sheet.stage = SheetStatus.error, None
             sheet.error = f"{type(exc).__name__}: {exc}"[:1000]
         sheet.cost_usd = float(
             session.exec(select(func.coalesce(func.sum(ModelCall.cost_usd), 0.0)).where(ModelCall.sheet_id == sheet_id)).one()
@@ -95,6 +98,19 @@ def process_sheet(
         session.refresh(sheet)
         session.expunge(sheet)
         return sheet
+
+
+def _mark_error(sheet_id: int, exc: Exception) -> None:
+    try:
+        with session_scope() as session:
+            sheet = session.get(Sheet, sheet_id)
+            if sheet is not None:
+                sheet.status, sheet.stage = SheetStatus.error, None
+                sheet.error = f"worker: {type(exc).__name__}: {exc}"[:1000]
+                session.add(sheet)
+                session.commit()
+    except Exception:  # noqa: BLE001
+        log.exception("could not mark sheet %s as failed", sheet_id)
 
 
 class Worker:
@@ -123,7 +139,7 @@ class Worker:
         self.start()
 
     def pending(self) -> int:
-        return self._queue.qsize() + (1 if self.current is not None else 0)
+        return self._queue.unfinished_tasks  # queued + the one being processed
 
     def resume_unfinished(self) -> int:
         """Re-queue sheets left queued/processing by a previous process."""
@@ -141,8 +157,11 @@ class Worker:
             self.current = sheet_id
             try:
                 process_sheet(sheet_id, options=options)
-            except Exception:
+            except Exception as exc:
+                # process_sheet handles stage errors itself; this is infrastructure failure
+                # (e.g. the database). Don't leave the sheet stuck in "processing".
                 log.exception("worker failed on sheet %s", sheet_id)
+                _mark_error(sheet_id, exc)
             finally:
                 self.current = None
                 self._queue.task_done()

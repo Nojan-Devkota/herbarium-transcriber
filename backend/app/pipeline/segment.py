@@ -22,7 +22,7 @@ from PIL import Image
 
 from app.models import Region, RegionKind
 from app.pipeline.context import CallRequest, PipelineContext
-from app.pipeline.ingest import load_image, to_jpeg
+from app.pipeline.ingest import downscale, load_image, to_jpeg
 from app.prompts import load_prompt
 from app.schemas.transcript import LocateOut
 
@@ -116,13 +116,12 @@ def reading_order(boxes: list[Box]) -> list[Box]:
 
 def _sam_boxes(ctx: PipelineContext, sheet_img: Image.Image) -> list[Box]:
     s = ctx.settings
-    small = sheet_img.copy()
-    small.thumbnail((s.sam_max_side, s.sam_max_side), Image.Resampling.LANCZOS)
+    small = downscale(sheet_img, s.sam_max_side)
     jpeg = to_jpeg(small, quality=88)
     sx, sy = sheet_img.width / small.width, sheet_img.height / small.height
     boxes: list[Box] = []
-    for concept, kind in CONCEPTS:
-        res = ctx.segment(concept, jpeg, key_extra=(s.sam_max_side,))
+    results = ctx.segment_many([c for c, _k in CONCEPTS], jpeg, key_extra=(s.sam_max_side,))
+    for (concept, kind), res in zip(CONCEPTS, results):
         for d in res.detections:
             if d.score is not None and d.score < s.sam_min_score:
                 continue

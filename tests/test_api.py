@@ -87,7 +87,8 @@ def test_review_accept_and_edit_are_logged(client, processed):
 
     stats = client.get("/stats").json()
     assert stats["fields_by_status"]["edited"] == 1 and stats["fields_by_status"]["accepted"] == 1
-    assert stats["edit_rate_by_confidence"]["high"] == 0.5
+    # eventDate (verified -> high) was edited; locality (unverified -> medium) was accepted
+    assert stats["edit_rate_by_confidence"]["high"] == 1.0 and stats["edit_rate_by_confidence"]["medium"] == 0.0
 
 
 def test_export_csv_is_darwin_core(client, processed):
@@ -112,7 +113,9 @@ def test_export_reviewed_only_skips_flagged(client, processed):
 
 def test_csv_formula_injection_is_neutralised():
     assert _safe("=HYPERLINK(1)") == "'=HYPERLINK(1)"
-    assert _safe("+1") == "'+1" and _safe("-12.5") == "-12.5" and _safe(None) == ""
+    assert _safe("-2+3+cmd|' /C calc'!A0").startswith("'")  # leading '-' formula
+    assert _safe(" =1+1").startswith("'") and _safe("@SUM(A1)").startswith("'")
+    assert _safe("-12.5") == "-12.5" and _safe("+1") == "+1" and _safe(None) == ""  # plain numbers untouched
 
 
 def test_reprocess_validates_ablation(client, processed, monkeypatch):
@@ -151,3 +154,68 @@ def test_polling_requests_are_kept_out_of_the_access_log():
     assert f.filter(rec("POST", "/sheets", 200))  # uploads stay visible
     assert f.filter(rec("GET", "/sheets/12/image", 200))
     assert f.filter(rec("GET", "/sheets", 500))  # errors stay visible
+
+
+def test_writes_from_other_machines_are_refused(client, monkeypatch):
+    from starlette.testclient import TestClient as RawClient
+
+    from app.main import app
+
+    remote = RawClient(app, client=("203.0.113.9", 5555))
+    assert remote.get("/health").status_code == 200  # reads stay open
+    assert remote.post("/batches/gbif", json={"scientific_name": "x"}).status_code == 403
+    monkeypatch.setenv("ALLOW_REMOTE_WRITES", "true")
+    from app import config
+
+    config.get_settings.cache_clear()
+    assert remote.post("/batches/gbif", json={"limit": 1}).status_code == 422  # now reaches validation
+
+
+def test_input_limits(client, processed):
+    assert client.post("/batches/gbif", json={"scientific_name": "x", "year": "18xx"}).status_code == 422
+    field_id = client.get(f"/sheets/{processed}").json()["fields"][0]["id"]
+    assert client.patch(f"/fields/{field_id}", json={"action": "edit", "value": "x" * 5000}).status_code == 422
+    files = [("files", (f"{i}.jpg", b"x", "image/jpeg")) for i in range(21)]
+    assert client.post("/sheets", files=files, data={"process": "false"}).status_code == 413
+    bad_url = client.post("/sheets", files=[("files", ("a.jpg", make_sheet_jpeg(), "image/jpeg"))], data={"process": "false", "source_url": "javascript:alert(1)"})
+    assert bad_url.status_code == 422
+
+
+def test_reprocess_and_review_conflicts(client, processed, monkeypatch):
+    from app.db import session_scope
+    from app.models import Sheet, SheetStatus
+
+    with session_scope() as s:
+        sheet = s.get(Sheet, processed)
+        sheet.status = SheetStatus.queued
+        s.add(sheet)
+        s.commit()
+    assert client.post(f"/sheets/{processed}/process", json={}).status_code == 409
+    field_id = client.get(f"/sheets/{processed}").json()["fields"][0]["id"]
+    assert client.patch(f"/fields/{field_id}", json={"action": "accept"}).status_code == 409
+
+
+def test_image_variants_and_cache_headers(client, processed):
+    thumb = client.get(f"/sheets/{processed}/image?size=thumb")
+    view = client.get(f"/sheets/{processed}/image")
+    full = client.get(f"/sheets/{processed}/image?size=full")
+    assert len(thumb.content) < len(view.content) <= len(full.content)
+    assert "immutable" in thumb.headers["cache-control"]
+    assert client.get(f"/sheets/{processed}/image?size=huge").status_code == 422
+
+
+def test_sheet_list_query_count_does_not_grow_with_sheets(client, settings):
+    from sqlalchemy import event
+
+    from app.db import get_engine
+
+    for i in range(6):
+        upload(client, data=make_sheet_jpeg(200 + i, 300))
+    statements = []
+    listener = lambda *a: statements.append(a[2])  # noqa: E731
+    event.listen(get_engine(), "before_cursor_execute", listener)
+    try:
+        assert len(client.get("/sheets").json()) == 6
+    finally:
+        event.remove(get_engine(), "before_cursor_execute", listener)
+    assert len([q for q in statements if q.lstrip().upper().startswith("SELECT")]) <= 3

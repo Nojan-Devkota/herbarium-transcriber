@@ -49,7 +49,7 @@ ABLATIONS: dict[str, RunOptions] = {
     "whole-sheet": RunOptions(use_sam=False, use_verify=False, use_second_pass=False),
     "sam-crops": RunOptions(use_verify=False, use_second_pass=False),
     "sam+verify": RunOptions(use_second_pass=False),
-    "full": RunOptions(),
+    "full": RunOptions(use_second_pass=True),
 }
 DESCRIPTIONS = {
     "whole-sheet": "1. Whole sheet → Spark",
@@ -109,7 +109,8 @@ def run_ablation(name: str, rows: list[dict[str, Any]], args: argparse.Namespace
             fields = s.exec(select(Field).where(Field.sheet_id == sid)).all()
             pred = {f.dwc_term: {"value": f.value, "verbatim": f.verbatim, "confidence_level": f.confidence_level} for f in fields}
             calls = s.exec(select(ModelCall).where(ModelCall.sheet_id == sid)).all()
-            rows_scored = score_sheet(pred, r["truth"], gbif.name_match)
+            # A sheet that failed to process is reported, not scored as if every field were wrong
+            rows_scored = score_sheet(pred, r["truth"], gbif.name_match) if sheet.status == SheetStatus.done else []
             for x in rows_scored:
                 x["key"] = r["key"]
             results += rows_scored
@@ -146,6 +147,7 @@ def summarize(run: dict[str, Any]) -> dict[str, Any]:
         "model_s": sum(s["nominal_model_s"] for s in sheets) / n,
         "flagged_share": sum(s["flagged"] for s in sheets) / total_fields,
         "errors": sum(1 for s in sheets if s["status"] != "done"),
+        "scored_sheets": sum(1 for s in sheets if s["status"] == "done"),
     }
 
 
@@ -170,15 +172,15 @@ def write_report(runs: list[dict[str, Any]], args: argparse.Namespace, n_sheets:
         "",
         "## Field accuracy by ablation",
         "",
-        "| Pipeline | " + " | ".join(EVAL_FIELDS) + " | Overall | Cost / sheet | Model time / sheet | Fields flagged |",
-        "|---|" + "---|" * (len(EVAL_FIELDS) + 4),
+        "| Pipeline | " + " | ".join(EVAL_FIELDS) + " | Overall | Cost / sheet | Model time / sheet | Fields flagged | Failed sheets |",
+        "|---|" + "---|" * (len(EVAL_FIELDS) + 5),
     ]
     for r in runs:
         s = summaries[r["ablation"]]
         cells = [pct(s["accuracy"][f][0]) if f in s["accuracy"] else "–" for f in EVAL_FIELDS]
         lines.append(
             f"| {DESCRIPTIONS[r['ablation']]} | " + " | ".join(cells)
-            + f" | **{pct(s['overall'])}** | ${s['cost']:.3f} | {s['model_s']:.0f} s | {pct(s['flagged_share'])} |"
+            + f" | **{pct(s['overall'])}** | ${s['cost']:.3f} | {s['model_s']:.0f} s | {pct(s['flagged_share'])} | {s['errors']} |"
         )
     first = summaries[runs[0]["ablation"]]
     lines += ["", "Fields scored per column: " + ", ".join(f"{f} n={first['accuracy'][f][1]}" for f in EVAL_FIELDS if f in first["accuracy"]) + "."]
@@ -251,6 +253,10 @@ def main() -> None:
     out.write_text(report, encoding="utf-8")
     print(report)
     print(f"wrote {out} and {out_json}", file=sys.stderr)
+    failed = {r["ablation"]: summarize(r)["errors"] for r in runs}
+    if any(failed.values()):
+        print(f"warning: sheets that failed to process (excluded from accuracy): {failed}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

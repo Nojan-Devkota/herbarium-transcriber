@@ -9,23 +9,28 @@ from __future__ import annotations
 
 import hashlib
 import io
+import ipaddress
 import logging
+import socket
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
 from PIL import Image, ImageOps, UnidentifiedImageError
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.config import Settings, get_settings
 from app.models import Sheet, SheetStatus
-from app.tools.gbif import GbifClient
+from app.cache import Cache
+from app.tools.gbif import GbifClient, shared_gbif
 
 log = logging.getLogger(__name__)
 
-Image.MAX_IMAGE_PIXELS = 250_000_000  # herbarium scans are large but legitimate
 MAX_DOWNLOAD_BYTES = 60 * 1024 * 1024
 
 # GBIF fields kept as ground truth for evaluation
@@ -64,17 +69,38 @@ def is_open_license(lic: str | None) -> bool:
 
 
 # --- images -----------------------------------------------------------------------
-def normalize_image(data: bytes) -> tuple[bytes, int, int]:
-    """Decode any common image format, apply EXIF rotation, return RGB JPEG bytes."""
+# Herbarium scans reach ~150 MP; anything far beyond that is a decompression bomb.
+Image.MAX_IMAGE_PIXELS = 200_000_000
+# Decoding a 150 MP scan takes ~450 MB of RAM; cap how many happen at once.
+_DECODE_SLOTS = threading.BoundedSemaphore(2)
+
+# Downscaled copies served to the UI instead of the multi-megabyte original
+VARIANT_SIDES = {"thumb": 480, "view": 1600}
+
+
+def _decode(data: bytes) -> Image.Image:
     try:
         im = Image.open(io.BytesIO(data))
         im = ImageOps.exif_transpose(im)
-        im = im.convert("RGB")
-    except (UnidentifiedImageError, OSError) as exc:
+        return im.convert("RGB")
+    except Image.DecompressionBombError as exc:
+        raise ValueError("image is too large (over 200 megapixels)") from exc
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
         raise ValueError("file is not a readable image") from exc
-    buf = io.BytesIO()
-    im.save(buf, "JPEG", quality=92)
-    return buf.getvalue(), im.width, im.height
+
+
+def downscale(im: Image.Image, max_side: int) -> Image.Image:
+    """A resized copy no larger than max_side (never a full-resolution copy first)."""
+    if max(im.size) <= max_side:
+        return im
+    return ImageOps.contain(im, (max_side, max_side), Image.Resampling.LANCZOS)
+
+
+def normalize_image(data: bytes) -> tuple[bytes, int, int]:
+    """Decode any common image format, apply EXIF rotation, return RGB JPEG bytes."""
+    with _DECODE_SLOTS:
+        im = _decode(data)
+        return to_jpeg(im, quality=92), im.width, im.height
 
 
 def load_image(path: str) -> Image.Image:
@@ -83,12 +109,30 @@ def load_image(path: str) -> Image.Image:
 
 
 def to_jpeg(im: Image.Image, max_side: int | None = None, quality: int = 88) -> bytes:
-    if max_side and max(im.size) > max_side:
-        im = im.copy()
-        im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    if max_side:
+        im = downscale(im, max_side)
     buf = io.BytesIO()
     im.save(buf, "JPEG", quality=quality)
     return buf.getvalue()
+
+
+def variant_path(image_path: str, size: str) -> Path:
+    p = Path(image_path)
+    return p.with_name(f"{p.stem}_{size}.jpg")
+
+
+def write_variants(im: Image.Image, image_path: str) -> None:
+    for size, side in VARIANT_SIDES.items():
+        variant_path(image_path, size).write_bytes(to_jpeg(im, max_side=side, quality=85))
+
+
+def ensure_variant(image_path: str, size: str) -> Path:
+    """Path of a downscaled copy, created on first request for sheets ingested before variants existed."""
+    path = variant_path(image_path, size)
+    if not path.exists():
+        with _DECODE_SLOTS:
+            write_variants(load_image(image_path), image_path)
+    return path
 
 
 def ingest_image(
@@ -108,9 +152,13 @@ def ingest_image(
     existing = session.exec(select(Sheet).where(Sheet.image_sha256 == sha)).first()
     if existing is not None:
         return existing, False
-    jpeg, width, height = normalize_image(data)
     path = settings.images_dir / f"{sha}.jpg"
-    path.write_bytes(jpeg)
+    with _DECODE_SLOTS:
+        im = _decode(data)
+        width, height = im.size
+        path.write_bytes(to_jpeg(im, quality=92))
+        write_variants(im, str(path))
+        del im
     sheet = Sheet(
         image_sha256=sha,
         image_path=str(path),
@@ -124,7 +172,12 @@ def ingest_image(
         status=SheetStatus.uploaded,
     )
     session.add(sheet)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError:
+        # A concurrent upload of the same image won the race; return its row.
+        session.rollback()
+        return session.exec(select(Sheet).where(Sheet.image_sha256 == sha)).one(), False
     session.refresh(sheet)
     return sheet, True
 
@@ -149,24 +202,73 @@ class BatchReport:
     skipped: list[dict[str, Any]] = field(default_factory=list)
 
 
+_download_client: httpx.Client | None = None
+_download_lock = threading.Lock()
+
+
+def download_client() -> httpx.Client:
+    """Shared HTTP client for image downloads (one connection pool for the process)."""
+    global _download_client
+    with _download_lock:
+        if _download_client is None:
+            _download_client = httpx.Client(headers={"User-Agent": "herbarium-label-transcriber/0.1"})
+        return _download_client
+
+
 # Many museum media servers are slow or hang; fail fast and move on to the next record.
 DOWNLOAD_TIMEOUT = httpx.Timeout(20.0, connect=8.0)
 DOWNLOAD_DEADLINE_S = 90.0
 
 
+class UnsafeURLError(ValueError):
+    """A URL that points at a non-public address (SSRF guard)."""
+
+
+def _resolve_ips(host: str) -> list[str]:
+    return [info[4][0] for info in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)]
+
+
+def assert_public_url(url: str) -> None:
+    """Only http(s) URLs whose host resolves exclusively to public addresses.
+
+    Image URLs come from third-party GBIF records, so without this a record could make
+    the server fetch internal services (localhost, cloud metadata, private networks).
+    """
+    parsed = httpx.URL(url)
+    if parsed.scheme not in ("http", "https") or not parsed.host:
+        raise UnsafeURLError(f"unsupported URL: {url[:80]}")
+    try:
+        ips = _resolve_ips(parsed.host)
+    except (socket.gaierror, UnicodeError) as exc:
+        raise UnsafeURLError(f"cannot resolve {parsed.host}") from exc
+    for ip in ips:
+        addr = ipaddress.ip_address(ip.split("%")[0])
+        if not addr.is_global or addr.is_multicast:
+            raise UnsafeURLError(f"{parsed.host} resolves to non-public address {addr}")
+
+
+MAX_REDIRECTS = 4
+
+
 def download_image(http: httpx.Client, url: str, deadline_s: float = DOWNLOAD_DEADLINE_S) -> bytes:
     start = time.monotonic()
-    with http.stream("GET", url, follow_redirects=True, timeout=DOWNLOAD_TIMEOUT) as resp:
-        resp.raise_for_status()
-        chunks, size = [], 0
-        for chunk in resp.iter_bytes():
-            size += len(chunk)
-            if size > MAX_DOWNLOAD_BYTES:
-                raise ValueError("image larger than 60 MB")
-            if time.monotonic() - start > deadline_s:
-                raise ValueError(f"download slower than {deadline_s:.0f} s")
-            chunks.append(chunk)
-    return b"".join(chunks)
+    for _hop in range(MAX_REDIRECTS + 1):
+        assert_public_url(url)  # re-checked on every redirect hop
+        with http.stream("GET", url, follow_redirects=False, timeout=DOWNLOAD_TIMEOUT) as resp:
+            if resp.is_redirect:
+                url = str(resp.url.join(resp.headers["location"]))
+                continue
+            resp.raise_for_status()
+            chunks, size = [], 0
+            for chunk in resp.iter_bytes():
+                size += len(chunk)
+                if size > MAX_DOWNLOAD_BYTES:
+                    raise ValueError("image larger than 60 MB")
+                if time.monotonic() - start > deadline_s:
+                    raise ValueError(f"download slower than {deadline_s:.0f} s")
+                chunks.append(chunk)
+            return b"".join(chunks)
+    raise ValueError("too many redirects")
 
 
 def fetch_gbif_batch(
@@ -191,8 +293,9 @@ def fetch_gbif_batch(
     `on_added(sheet_id)` is called as soon as each new sheet is stored, so
     processing can start while the rest of the batch is still downloading.
     """
-    gbif = gbif or GbifClient()
-    http = http or httpx.Client(headers={"User-Agent": "herbarium-label-transcriber/0.1"})
+    settings = settings or get_settings()
+    gbif = gbif or shared_gbif(Cache(settings.cache_dir))
+    http = http or download_client()
     report = BatchReport()
     page_size = min(max(limit * 2, 20), 100)
     for page in range(max_pages):
@@ -233,7 +336,12 @@ def fetch_gbif_batch(
                     gbif_record=gbif_truth(occ),
                     settings=settings,
                 )
+            except UnsafeURLError as exc:
+                log.warning("GBIF %s: refusing image URL: %s", key, exc)
+                report.skipped.append({"key": key, "reason": "image URL is not a public address"})
+                continue
             except (httpx.HTTPError, ValueError) as exc:
+                log.warning("GBIF %s: skipped %s: %s: %s", key, url, type(exc).__name__, exc)
                 report.skipped.append({"key": key, "reason": f"download failed: {type(exc).__name__}"})
                 continue
             (report.added if created else report.existing).append(sheet.id)

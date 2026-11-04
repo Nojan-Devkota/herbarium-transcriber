@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type { Region } from "../api";
 import { api } from "../api";
 
@@ -31,13 +32,14 @@ interface Props {
 }
 
 /** The sheet image with SAM 3.1 region overlays drawn in full-resolution sheet coordinates. */
-export default function SheetCanvas({ sheetId, width, height, regions, selectedRegionId, onSelectRegion }: Props) {
+function SheetCanvas({ sheetId, width, height, regions, selectedRegionId, onSelectRegion }: Props) {
   const font = Math.max(width, height) * 0.014;
   const anySelected = selectedRegionId !== null;
   return (
     <div className="sheet-canvas" style={{ aspectRatio: `${width} / ${height}` }}>
-      <img src={api.imageUrl(sheetId)} alt="Herbarium sheet" draggable={false} />
-      <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label="Detected regions">
+      {/* 1600 px display copy; overlays use full-resolution coordinates via the viewBox */}
+      <img src={api.imageUrl(sheetId, "view")} alt="Herbarium sheet" draggable={false} decoding="async" />
+      <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-label="Detected regions">
         {anySelected && (
           <path
             // Dim everything except the selected region
@@ -60,6 +62,16 @@ export default function SheetCanvas({ sheetId, width, height, regions, selectedR
               key={r.id}
               className={`region ${selected ? "selected" : ""}`}
               onClick={() => onSelectRegion?.(r.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onSelectRegion?.(r.id);
+                }
+              }}
+              tabIndex={onSelectRegion ? 0 : undefined}
+              role={onSelectRegion ? "button" : undefined}
+              aria-label={`Region ${tag}`}
+              aria-pressed={onSelectRegion ? selected : undefined}
               style={{ cursor: onSelectRegion ? "pointer" : "default" }}
             >
               <rect
@@ -84,3 +96,6 @@ export default function SheetCanvas({ sheetId, width, height, regions, selectedR
     </div>
   );
 }
+
+// Polling replaces the sheet object every few seconds; skip re-rendering the SVG when nothing it shows changed.
+export default memo(SheetCanvas);

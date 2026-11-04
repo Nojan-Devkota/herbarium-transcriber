@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     gbif_min_match_confidence: int = 90
     earliest_plausible_year: int = 1700
 
+    # --- API -----------------------------------------------------------
+    # No accounts: mutating requests (which spend API credit) are accepted from localhost only
+    allow_remote_writes: bool = False
+
     # --- Optional georeferencing ---------------------------------------
     geocode_enabled: bool = False
     geocode_user_agent: str = "herbarium-label-transcriber/0.1"

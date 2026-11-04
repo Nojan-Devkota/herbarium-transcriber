@@ -30,9 +30,10 @@ from *typing* to *reviewing*.
    Spark a *targeted* question about the crop ("is the year 1897 or 1891?"), at most twice
    per field. Every step is logged and shown in the UI.
 6. **Confidence & review** — confidence comes from evidence, not model self-report:
-   grounding + external checks + agreement between two independent readings (the second
-   reading runs only for fields that aren't already high-confidence). The curator reviews
-   flagged fields side by side with the sheet and exports a Darwin Core CSV.
+   grounding + external checks (+ agreement with an independent second reading, an opt-in
+   step: the evaluation showed it adds cost and time without accuracy, so it is off by
+   default). The curator reviews flagged fields side by side with the sheet and exports a
+   Darwin Core CSV.
 
 ```
  upload / GBIF ──► SAM 3.1 regions ──► verbatim reading ──► Darwin Core interpretation
@@ -102,7 +103,7 @@ Backend:
 cd backend
 python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
-pytest                        # 97 offline tests, no key needed
+pytest                        # 125 offline tests, no key needed
 uvicorn app.main:app --reload # http://127.0.0.1:8000
 ```
 
@@ -166,6 +167,22 @@ Interactive docs at `/docs` when the backend is running.
 - **Licensed data only.** GBIF batches keep CC0 / CC BY images; licence is stored per sheet
   and exported.
 
+## Performance and safety
+
+- **No wasted work.** SAM concept requests run concurrently; the second reading is opt-in;
+  every model call is cached by content hash; network clients are shared per process.
+  The UI polls only while sheets are processing and pauses in hidden tabs.
+- **Small images.** The UI loads 480 px thumbnails (~15 KB) and a 1600 px view (~150 KB)
+  instead of the original scans (avg 9 MB, up to 17 MB), all cacheable.
+- **Lean queries.** Sheet lists and dashboard stats are SQL aggregates, not N+1 queries.
+- **Safe by default.** Image downloads only reach public `http(s)` hosts (SSRF guard,
+  re-checked on every redirect); requests that spend API credit or change data are
+  accepted from localhost only unless `ALLOW_REMOTE_WRITES=true`; uploads are size-,
+  count- and pixel-limited; CSV export neutralises spreadsheet formulas; label text is
+  fenced off as data in prompts.
+- **Honest failures.** If GBIF is unreachable, affected fields are flagged rather than
+  auto-accepted; failed sheets keep their cost records and are excluded from accuracy.
+
 ## Repository layout
 
 ```
@@ -181,7 +198,7 @@ backend/app/
 frontend/src/          React + Vite: Upload, Review (canvas, fields, agent trace), Batch
 eval/                  build_gold.py, gold/dev.jsonl (frozen), metrics.py, run_eval.py, report.md
 scripts/seed_demo.py   pre-run demo sheets into the cache
-tests/                 97 offline tests (schemas, tools, pipeline, API, export, metrics)
+tests/                 125 offline tests (schemas, tools, pipeline, API, export, security, metrics)
 ```
 
 ## Built during the hackathon

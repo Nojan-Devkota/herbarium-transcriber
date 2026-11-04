@@ -27,7 +27,9 @@ export default function Review({ sheetId }: { sheetId: number }) {
   const [selectedField, setSelectedField] = useState<number | null>(null);
   const [selectedRegion, setSelectedRegion] = useState<number | null>(null);
   const [filter, setFilter] = useState<"all" | "review">("all");
-  const [ablation, setAblation] = useState<Ablation>("full");
+  const [ablation, setAblation] = useState<Ablation>("sam+verify");
+  const [actionError, setActionError] = useState<string>();
+  const [rerunning, setRerunning] = useState(false);
 
   const fields = useMemo(() => {
     const all = data?.fields ?? [];
@@ -38,6 +40,11 @@ export default function Review({ sheetId }: { sheetId: number }) {
   const region = data?.regions.find((r) => r.id === regionId) ?? null;
   const transcriptFor = (pass: number): Transcript | undefined =>
     data?.transcripts.find((t) => t.region_id === regionId && t.pass_no === pass);
+
+  const selectRegion = useCallback((id: number) => {
+    setSelectedRegion(id);
+    setSelectedField(null);
+  }, []);
 
   const review = useCallback(
     async (f: Field, action: "accept" | "edit", value?: string) => {
@@ -50,8 +57,10 @@ export default function Review({ sheetId }: { sheetId: number }) {
   // Keyboard review: j/k (or arrows) move, a accepts
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement).tagName;
-      if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+      const target = e.target as HTMLElement;
+      if (["INPUT", "SELECT", "TEXTAREA", "BUTTON"].includes(target.tagName) || target.isContentEditable) return;
+      // Ctrl/Cmd+A must stay "select all"; holding a key must not fire repeated saves
+      if (e.ctrlKey || e.metaKey || e.altKey || e.repeat || e.defaultPrevented) return;
       const idx = fields.findIndex((f) => f.id === selectedField);
       if (e.key === "j" || e.key === "ArrowDown") {
         const next = fields[Math.min(fields.length - 1, idx + 1)];
@@ -61,15 +70,20 @@ export default function Review({ sheetId }: { sheetId: number }) {
         const prev = fields[Math.max(0, idx - 1)];
         if (prev) setSelectedField(prev.id);
         e.preventDefault();
-      } else if (e.key === "a" && field) {
-        review(field, "accept");
+      } else if (e.key === "a" && field && field.status !== "accepted") {
+        review(field, "accept").catch((err) => setActionError(err instanceof Error ? err.message : String(err)));
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [fields, selectedField, field, review]);
 
-  if (error && !data) return <div className="page error-box">Could not load sheet {sheetId}: {error}</div>;
+  if (error && !data)
+    return (
+      <div className="page error-box" role="alert">
+        Could not load sheet {sheetId}: {error}
+      </div>
+    );
   if (!data) return <div className="page muted">Loading…</div>;
 
   const { sheet } = data;
@@ -103,20 +117,29 @@ export default function Review({ sheetId }: { sheetId: number }) {
         </div>
         <div className="rerun">
           <select value={ablation} onChange={(e) => setAblation(e.target.value as Ablation)} aria-label="Pipeline variant">
-            <option value="full">Full pipeline</option>
-            <option value="sam+verify">SAM + verify (no 2nd pass)</option>
+            <option value="sam+verify">Standard pipeline</option>
+            <option value="full">+ second reading (slower, costlier)</option>
             <option value="sam-crops">SAM crops only</option>
             <option value="whole-sheet">Whole sheet only</option>
           </select>
           <button
             className="ghost"
-            disabled={!isFinished(sheet.status)}
+            disabled={!isFinished(sheet.status) || rerunning}
             onClick={async () => {
-              const summary = await api.reprocess(sheet.id, ablation);
-              setSelectedField(null);
-              setSelectedRegion(null);
-              setData((d) => d && { ...d, sheet: summary, regions: [], transcripts: [], fields: [] });
-              setPollKey((k) => k + 1); // restart polling until the re-run finishes
+              if (reviewed > 0 && !window.confirm(`Re-running replaces this sheet's results, including ${reviewed} reviewed field(s). Continue?`)) return;
+              setRerunning(true);
+              setActionError(undefined);
+              try {
+                const summary = await api.reprocess(sheet.id, ablation);
+                setSelectedField(null);
+                setSelectedRegion(null);
+                setData((d) => d && { ...d, sheet: summary, regions: [], transcripts: [], fields: [] });
+                setPollKey((k) => k + 1); // restart polling until the re-run finishes
+              } catch (err) {
+                setActionError(err instanceof Error ? err.message : String(err));
+              } finally {
+                setRerunning(false);
+              }
             }}
           >
             Re-run
@@ -125,7 +148,7 @@ export default function Review({ sheetId }: { sheetId: number }) {
       </div>
 
       {!isFinished(sheet.status) && (
-        <div className="progress">
+        <div className="progress" role="status" aria-live="polite">
           {STAGES.map((s) => (
             <span
               key={s}
@@ -137,7 +160,21 @@ export default function Review({ sheetId }: { sheetId: number }) {
           <span className="muted">{sheet.status === "queued" ? "waiting in queue…" : "working…"}</span>
         </div>
       )}
-      {sheet.status === "error" && <div className="error-box">Processing failed: {sheet.error}</div>}
+      {sheet.status === "error" && (
+        <div className="error-box" role="alert">
+          Processing failed: {sheet.error}
+        </div>
+      )}
+      {actionError && (
+        <div className="error-box" role="alert">
+          {actionError}
+        </div>
+      )}
+      {error && (
+        <div className="error-box" role="alert">
+          Lost contact with the server: {error}
+        </div>
+      )}
 
       <div className="review-grid">
         <section className="left">
@@ -147,10 +184,7 @@ export default function Review({ sheetId }: { sheetId: number }) {
             height={sheet.height}
             regions={data.regions}
             selectedRegionId={regionId}
-            onSelectRegion={(id) => {
-              setSelectedRegion(id);
-              setSelectedField(null);
-            }}
+            onSelectRegion={selectRegion}
           />
           {region && (
             <div className="source-panel">
@@ -193,10 +227,10 @@ export default function Review({ sheetId }: { sheetId: number }) {
               {reviewed}/{data.fields.length} reviewed · {flagged} flagged
             </span>
             <div className="seg">
-              <button className={filter === "all" ? "on" : ""} onClick={() => setFilter("all")}>
+              <button className={filter === "all" ? "on" : ""} aria-pressed={filter === "all"} onClick={() => setFilter("all")}>
                 All
               </button>
-              <button className={filter === "review" ? "on" : ""} onClick={() => setFilter("review")}>
+              <button className={filter === "review" ? "on" : ""} aria-pressed={filter === "review"} onClick={() => setFilter("review")}>
                 Needs review
               </button>
             </div>

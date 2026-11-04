@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from typing import Any
@@ -20,6 +21,7 @@ from openai import OpenAI
 from app.clients.base import Detection, LLMClient, SegmentResult, Usage, jpeg_data_url
 from app.config import Settings
 
+log = logging.getLogger(__name__)
 _OBJECT_RE = re.compile(r"(\d+)<\|box;([^|]*)\|>")
 _FRAME_RE = re.compile(r"<(\d+)f>")
 
@@ -49,6 +51,7 @@ def parse_sam_output(text: str, frame: int = 0) -> tuple[list[Detection], int | 
         sections.append((int(m.group(1)), text[m.end() : end]))
     if not marks and text.strip():
         sections.append((0, text))
+    dropped = 0
     for idx, body in sections:
         if idx != frame:
             continue
@@ -56,18 +59,27 @@ def parse_sam_output(text: str, frame: int = 0) -> tuple[list[Detection], int | 
             kv = _kv(box_body)
             try:
                 det = Detection(
-                    x1=int(kv["x1"]),
-                    y1=int(kv["y1"]),
-                    x2=int(kv["x2"]),
-                    y2=int(kv["y2"]),
+                    x1=_int(kv["x1"]),
+                    y1=_int(kv["y1"]),
+                    x2=_int(kv["x2"]),
+                    y2=_int(kv["y2"]),
                     score=float(kv["c"]) if "c" in kv else None,
                 )
+                if "w" in kv:
+                    width = _int(kv["w"])
+                if "h" in kv:
+                    height = _int(kv["h"])
             except (KeyError, ValueError):
-                continue  # skip a malformed record rather than failing the sheet
-            width = int(kv.get("w", width or 0)) or width
-            height = int(kv.get("h", height or 0)) or height
+                dropped += 1  # skip a malformed record rather than failing the sheet
+                continue
             detections.append(det)
+    if dropped:
+        log.warning("SAM output: dropped %d malformed record(s), kept %d", dropped, len(detections))
     return detections, width, height
+
+
+def _int(v: str) -> int:
+    return int(float(v))  # tolerate "1024.0"
 
 
 class MetaModelClient(LLMClient):
