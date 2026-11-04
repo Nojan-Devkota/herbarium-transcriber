@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 Ablation = Literal["full", "sam+verify", "sam-crops", "whole-sheet"]
 
@@ -96,10 +96,10 @@ class UploadResult(BaseModel):
 
 
 class GbifBatchRequest(BaseModel):
-    dataset_key: str | None = None
-    scientific_name: str | None = None
-    taxon_key: int | None = None
-    year: str | None = Field(default=None, description="Year or range, e.g. '1850,1950'")
+    dataset_key: str | None = Field(default=None, max_length=64)
+    scientific_name: str | None = Field(default=None, max_length=200)
+    taxon_key: int | None = Field(default=None, ge=0)
+    year: str | None = Field(default=None, pattern=r"^\d{4}(,\d{4})?$", description="Year or range, e.g. '1850,1950'")
     limit: int = Field(default=10, ge=1, le=50)
     process: bool = True
 
@@ -112,7 +112,13 @@ class GbifBatchResult(BaseModel):
 
 class FieldPatch(BaseModel):
     action: Literal["accept", "edit"]
-    value: str | None = None
+    value: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def _edit_needs_value(self) -> FieldPatch:
+        if self.action == "edit" and self.value is None:
+            raise ValueError("an edit needs a value")
+        return self
 
 
 class ProcessRequest(BaseModel):

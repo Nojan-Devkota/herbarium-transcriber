@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import ipaddress
 import logging
+import socket
 import threading
 import time
 from collections.abc import Callable
@@ -218,19 +220,55 @@ DOWNLOAD_TIMEOUT = httpx.Timeout(20.0, connect=8.0)
 DOWNLOAD_DEADLINE_S = 90.0
 
 
+class UnsafeURLError(ValueError):
+    """A URL that points at a non-public address (SSRF guard)."""
+
+
+def _resolve_ips(host: str) -> list[str]:
+    return [info[4][0] for info in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)]
+
+
+def assert_public_url(url: str) -> None:
+    """Only http(s) URLs whose host resolves exclusively to public addresses.
+
+    Image URLs come from third-party GBIF records, so without this a record could make
+    the server fetch internal services (localhost, cloud metadata, private networks).
+    """
+    parsed = httpx.URL(url)
+    if parsed.scheme not in ("http", "https") or not parsed.host:
+        raise UnsafeURLError(f"unsupported URL: {url[:80]}")
+    try:
+        ips = _resolve_ips(parsed.host)
+    except (socket.gaierror, UnicodeError) as exc:
+        raise UnsafeURLError(f"cannot resolve {parsed.host}") from exc
+    for ip in ips:
+        addr = ipaddress.ip_address(ip.split("%")[0])
+        if not addr.is_global or addr.is_multicast:
+            raise UnsafeURLError(f"{parsed.host} resolves to non-public address {addr}")
+
+
+MAX_REDIRECTS = 4
+
+
 def download_image(http: httpx.Client, url: str, deadline_s: float = DOWNLOAD_DEADLINE_S) -> bytes:
     start = time.monotonic()
-    with http.stream("GET", url, follow_redirects=True, timeout=DOWNLOAD_TIMEOUT) as resp:
-        resp.raise_for_status()
-        chunks, size = [], 0
-        for chunk in resp.iter_bytes():
-            size += len(chunk)
-            if size > MAX_DOWNLOAD_BYTES:
-                raise ValueError("image larger than 60 MB")
-            if time.monotonic() - start > deadline_s:
-                raise ValueError(f"download slower than {deadline_s:.0f} s")
-            chunks.append(chunk)
-    return b"".join(chunks)
+    for _hop in range(MAX_REDIRECTS + 1):
+        assert_public_url(url)  # re-checked on every redirect hop
+        with http.stream("GET", url, follow_redirects=False, timeout=DOWNLOAD_TIMEOUT) as resp:
+            if resp.is_redirect:
+                url = str(resp.url.join(resp.headers["location"]))
+                continue
+            resp.raise_for_status()
+            chunks, size = [], 0
+            for chunk in resp.iter_bytes():
+                size += len(chunk)
+                if size > MAX_DOWNLOAD_BYTES:
+                    raise ValueError("image larger than 60 MB")
+                if time.monotonic() - start > deadline_s:
+                    raise ValueError(f"download slower than {deadline_s:.0f} s")
+                chunks.append(chunk)
+            return b"".join(chunks)
+    raise ValueError("too many redirects")
 
 
 def fetch_gbif_batch(
@@ -298,7 +336,12 @@ def fetch_gbif_batch(
                     gbif_record=gbif_truth(occ),
                     settings=settings,
                 )
+            except UnsafeURLError as exc:
+                log.warning("GBIF %s: refusing image URL: %s", key, exc)
+                report.skipped.append({"key": key, "reason": "image URL is not a public address"})
+                continue
             except (httpx.HTTPError, ValueError) as exc:
+                log.warning("GBIF %s: skipped %s: %s: %s", key, url, type(exc).__name__, exc)
                 report.skipped.append({"key": key, "reason": f"download failed: {type(exc).__name__}"})
                 continue
             (report.added if created else report.existing).append(sheet.id)

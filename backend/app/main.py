@@ -16,10 +16,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+import httpx
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import case, func
 from sqlmodel import Session, select
@@ -73,6 +74,21 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="Herbarium Label Transcriber", version="0.1.0", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024)  # sheet detail JSON compresses ~5-10x
+
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+_LOOPBACK = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+@app.middleware("http")
+async def local_writes_only(request: Request, call_next):
+    """Uploads, batches, re-runs and reviews spend paid API credit or change data. There are
+    no user accounts, so unless ALLOW_REMOTE_WRITES=true they are only accepted from this
+    machine; reading stays open (e.g. showing the UI on a LAN)."""
+    if request.method not in _SAFE_METHODS and not get_settings().allow_remote_writes:
+        host = request.client.host if request.client else ""
+        if host not in _LOOPBACK:
+            return JSONResponse({"detail": "writes are only allowed from localhost (set ALLOW_REMOTE_WRITES=true)"}, status_code=403)
+    return await call_next(request)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -136,25 +152,34 @@ def health() -> dict:
     return {"ok": True, "client": s.llm_client, "spark": s.model_spark, "sam": s.model_sam, "worker_pending": worker.pending()}
 
 
+MAX_FILES_PER_UPLOAD = 20
+
+
 @app.post("/sheets", response_model=list[api.UploadResult])
-async def upload_sheets(
+def upload_sheets(
     files: list[UploadFile] = File(...),
-    license: str | None = Form(None),
-    source_url: str | None = Form(None),
+    license: str | None = Form(None, max_length=200),
+    source_url: str | None = Form(None, max_length=2000, pattern=r"^https?://"),
     process: bool = Form(True),
     session: Session = Depends(get_session),
 ) -> list[api.UploadResult]:
+    # A plain `def`: hashing, decoding and re-encoding large scans is blocking work, so
+    # FastAPI runs it in its thread pool instead of stalling the event loop.
+    if len(files) > MAX_FILES_PER_UPLOAD:
+        raise HTTPException(413, f"at most {MAX_FILES_PER_UPLOAD} files per upload")
     results = []
     for upload in files:
-        data = await upload.read(MAX_DOWNLOAD_BYTES + 1)
+        data = upload.file.read(MAX_DOWNLOAD_BYTES + 1)
         if len(data) > MAX_DOWNLOAD_BYTES:
             results.append(api.UploadResult(id=None, filename=upload.filename, created=False, error="file larger than 60 MB"))
             continue
         try:
-            sheet, created = ingest_image(session, data, filename=upload.filename, source_url=source_url, license=license)
+            sheet, created = ingest_image(session, data, filename=(upload.filename or "")[:200] or None, source_url=source_url, license=license)
         except ValueError as exc:
             results.append(api.UploadResult(id=None, filename=upload.filename, created=False, error=str(exc)))
             continue
+        finally:
+            del data
         if process and (created or sheet.status in (SheetStatus.uploaded, SheetStatus.error)):
             worker.enqueue(sheet.id)
         results.append(api.UploadResult(id=sheet.id, filename=upload.filename, created=created))
@@ -165,15 +190,18 @@ async def upload_sheets(
 def gbif_batch(req: api.GbifBatchRequest, session: Session = Depends(get_session)) -> api.GbifBatchResult:
     if not (req.dataset_key or req.scientific_name or req.taxon_key):
         raise HTTPException(422, "give a dataset_key, scientific_name or taxon_key")
-    report = fetch_gbif_batch(
-        session,
-        dataset_key=req.dataset_key,
-        scientific_name=req.scientific_name,
-        taxon_key=req.taxon_key,
-        year=req.year,
-        limit=req.limit,
-        on_added=worker.enqueue if req.process else None,
-    )
+    try:
+        report = fetch_gbif_batch(
+            session,
+            dataset_key=req.dataset_key,
+            scientific_name=req.scientific_name,
+            taxon_key=req.taxon_key,
+            year=req.year,
+            limit=req.limit,
+            on_added=worker.enqueue if req.process else None,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"GBIF is unavailable: {type(exc).__name__}") from exc
     return api.GbifBatchResult(added=report.added, existing=report.existing, skipped=report.skipped)
 
 
@@ -240,8 +268,8 @@ def region_crop(region_id: int, session: Session = Depends(get_session)) -> File
 @app.post("/sheets/{sheet_id}/process", response_model=api.SheetSummary)
 def reprocess(sheet_id: int, req: api.ProcessRequest | None = None, session: Session = Depends(get_session)) -> api.SheetSummary:
     sheet = _get_sheet(session, sheet_id)
-    if sheet.status == SheetStatus.processing:
-        raise HTTPException(409, "sheet is being processed")
+    if sheet.status in (SheetStatus.queued, SheetStatus.processing):
+        raise HTTPException(409, f"sheet is already {sheet.status.value}")
     worker.enqueue(sheet_id, ABLATIONS[(req or api.ProcessRequest()).ablation])
     session.refresh(sheet)
     return _summary_one(session, sheet)
@@ -252,11 +280,12 @@ def review_field(field_id: int, patch: api.FieldPatch, session: Session = Depend
     field = session.get(Field, field_id)
     if field is None:
         raise HTTPException(404, f"field {field_id} not found")
+    sheet = session.get(Sheet, field.sheet_id)
+    if sheet is not None and sheet.status in (SheetStatus.queued, SheetStatus.processing):
+        raise HTTPException(409, "sheet is being re-processed; review it when it is done")
     old = field.value
     if patch.action == "edit":
-        if patch.value is None:
-            raise HTTPException(422, "an edit needs a value")
-        new = patch.value.strip()
+        new = (patch.value or "").strip()
         field.value = new
         field.status = FieldStatus.edited if new != (field.model_value or "") else FieldStatus.accepted
     else:

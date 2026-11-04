@@ -51,12 +51,24 @@ COLUMNS: list[str] = [
     "x_fieldsNeedingReview",
 ]
 
-_FORMULA_PREFIXES = ("=", "+", "@", "\t", "\r")
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n", "|")
+
+
+def _is_number(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
 
 
 def _safe(value: object) -> str:
+    """Neutralise cells a spreadsheet would run as a formula (OWASP CSV injection),
+    while leaving plain numbers such as a negative latitude untouched."""
     s = "" if value is None else str(value)
-    return "'" + s if s.startswith(_FORMULA_PREFIXES) else s
+    if s.lstrip().startswith(_FORMULA_PREFIXES) and not _is_number(s.strip()):
+        return "'" + s
+    return s
 
 
 def sheet_row(sheet: Sheet, fields: Iterable[Field]) -> dict[str, str]:
