@@ -59,3 +59,16 @@ def test_cache_dir_override(monkeypatch, tmp_path):
     monkeypatch.setenv("CACHE_DIR", str(tmp_path / "shared-cache"))
     config.get_settings.cache_clear()
     assert config.get_settings().cache_dir == tmp_path / "shared-cache"
+
+
+def test_relative_data_dir_is_anchored_to_backend(monkeypatch, tmp_path):
+    from app import config
+
+    monkeypatch.setenv("DATA_DIR", "./some-data")
+    for cwd in (config.REPO_ROOT, config.BACKEND_DIR):
+        monkeypatch.chdir(cwd)
+        config.get_settings.cache_clear()
+        s = config.Settings()
+        assert s.data_dir == (config.BACKEND_DIR / "some-data").resolve()
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    assert config.Settings().data_dir == tmp_path  # absolute paths are left alone

@@ -10,10 +10,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+BACKEND_DIR = REPO_ROOT / "backend"
 
 Effort = Literal["minimal", "low", "medium", "high", "xhigh", "max"]
 
@@ -71,6 +72,15 @@ class Settings(BaseSettings):
     # --- Optional georeferencing ---------------------------------------
     geocode_enabled: bool = False
     geocode_user_agent: str = "herbarium-label-transcriber/0.1"
+
+    @field_validator("data_dir", "cache_dir_override", mode="after")
+    @classmethod
+    def _anchor_relative(cls, v: Path | None) -> Path | None:
+        # A relative path in .env (e.g. DATA_DIR=./data) must mean the same folder no matter
+        # where a command is started (server from backend/, scripts from the repo root).
+        if v is not None and not v.is_absolute():
+            return (BACKEND_DIR / v).resolve()
+        return v
 
     @property
     def db_path(self) -> Path:
