@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from typing import Any
 
 import httpx
@@ -112,3 +113,16 @@ def name_check_passed(match: dict[str, Any], min_confidence: int = 90) -> bool:
     if match.get("matchType") == "FUZZY" and (match.get("confidence") or 0) < min_confidence:
         return False
     return (match.get("rank") or "").upper() in {"SPECIES", "SUBSPECIES", "VARIETY", "FORM", "SUBVARIETY", "SUBFORM"}
+
+
+_shared: dict[tuple[str, bool], GbifClient] = {}
+_shared_lock = threading.Lock()
+
+
+def shared_gbif(cache: Cache | None) -> GbifClient:
+    """One GBIF client (and connection pool) per cache location, reused across sheets."""
+    key = (str(cache.root) if cache else "", bool(cache and cache.enabled))
+    with _shared_lock:
+        if key not in _shared:
+            _shared[key] = GbifClient(cache=cache)
+        return _shared[key]

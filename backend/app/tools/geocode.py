@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import math
+import threading
+import time
 import unicodedata
 from typing import Any
 
@@ -70,9 +72,20 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 class Geocoder:
+    MIN_INTERVAL_S = 1.0  # Nominatim usage policy: at most one request per second
+
     def __init__(self, user_agent: str, http: httpx.Client | None = None, cache: Cache | None = None):
         self.http = http or httpx.Client(timeout=20.0, headers={"User-Agent": user_agent})
         self.cache = cache
+        self._throttle = threading.Lock()
+        self._last = 0.0
+
+    def _wait_turn(self) -> None:
+        with self._throttle:
+            delay = self.MIN_INTERVAL_S - (time.monotonic() - self._last)
+            if delay > 0:
+                time.sleep(delay)
+            self._last = time.monotonic()
 
     def geocode(self, locality: str, state: str | None = None, country_code: str | None = None) -> dict[str, Any] | None:
         query = ", ".join(p for p in (locality, state) if p)
@@ -83,6 +96,7 @@ class Geocoder:
         params = {"q": query, "format": "jsonv2", "limit": 1}
         if country_code:
             params["countrycodes"] = country_code.lower()
+        self._wait_turn()
         resp = self.http.get("https://nominatim.openstreetmap.org/search", params=params)
         resp.raise_for_status()
         hits = resp.json()
@@ -102,3 +116,16 @@ class Geocoder:
         if self.cache:
             self.cache.set("geocode", hkey, {"result": result})
         return result
+
+
+_shared_geocoders: dict[tuple[str, str], Geocoder] = {}
+_geo_lock = threading.Lock()
+
+
+def shared_geocoder(user_agent: str, cache: Cache | None) -> Geocoder:
+    """One geocoder per process so the 1 request/second throttle holds across sheets."""
+    key = (user_agent, str(cache.root) if cache else "")
+    with _geo_lock:
+        if key not in _shared_geocoders:
+            _shared_geocoders[key] = Geocoder(user_agent, cache=cache)
+        return _shared_geocoders[key]

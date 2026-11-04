@@ -87,7 +87,8 @@ def test_review_accept_and_edit_are_logged(client, processed):
 
     stats = client.get("/stats").json()
     assert stats["fields_by_status"]["edited"] == 1 and stats["fields_by_status"]["accepted"] == 1
-    assert stats["edit_rate_by_confidence"]["high"] == 0.5
+    # eventDate (verified -> high) was edited; locality (unverified -> medium) was accepted
+    assert stats["edit_rate_by_confidence"]["high"] == 1.0 and stats["edit_rate_by_confidence"]["medium"] == 0.0
 
 
 def test_export_csv_is_darwin_core(client, processed):

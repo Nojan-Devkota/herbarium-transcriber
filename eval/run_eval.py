@@ -49,7 +49,7 @@ ABLATIONS: dict[str, RunOptions] = {
     "whole-sheet": RunOptions(use_sam=False, use_verify=False, use_second_pass=False),
     "sam-crops": RunOptions(use_verify=False, use_second_pass=False),
     "sam+verify": RunOptions(use_second_pass=False),
-    "full": RunOptions(),
+    "full": RunOptions(use_second_pass=True),
 }
 DESCRIPTIONS = {
     "whole-sheet": "1. Whole sheet → Spark",

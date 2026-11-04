@@ -116,7 +116,7 @@ class FieldPatch(BaseModel):
 
 
 class ProcessRequest(BaseModel):
-    ablation: Ablation = "full"
+    ablation: Ablation = "sam+verify"
 
 
 class Stats(BaseModel):
