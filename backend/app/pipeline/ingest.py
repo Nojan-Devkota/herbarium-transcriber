@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -147,14 +149,22 @@ class BatchReport:
     skipped: list[dict[str, Any]] = field(default_factory=list)
 
 
-def download_image(http: httpx.Client, url: str) -> bytes:
-    with http.stream("GET", url, follow_redirects=True, timeout=60.0) as resp:
+# Many museum media servers are slow or hang; fail fast and move on to the next record.
+DOWNLOAD_TIMEOUT = httpx.Timeout(20.0, connect=8.0)
+DOWNLOAD_DEADLINE_S = 90.0
+
+
+def download_image(http: httpx.Client, url: str, deadline_s: float = DOWNLOAD_DEADLINE_S) -> bytes:
+    start = time.monotonic()
+    with http.stream("GET", url, follow_redirects=True, timeout=DOWNLOAD_TIMEOUT) as resp:
         resp.raise_for_status()
         chunks, size = [], 0
         for chunk in resp.iter_bytes():
             size += len(chunk)
             if size > MAX_DOWNLOAD_BYTES:
                 raise ValueError("image larger than 60 MB")
+            if time.monotonic() - start > deadline_s:
+                raise ValueError(f"download slower than {deadline_s:.0f} s")
             chunks.append(chunk)
     return b"".join(chunks)
 
@@ -172,11 +182,14 @@ def fetch_gbif_batch(
     max_pages: int = 5,
     require: tuple[str, ...] = (),
     settings: Settings | None = None,
+    on_added: Callable[[int], None] | None = None,
 ) -> BatchReport:
     """Pull up to `limit` openly licensed specimen images from GBIF into Sheets.
 
     `require` lists GBIF fields that must be present (e.g. recordedBy, eventDate)
     — used when building the evaluation set so every sheet has ground truth.
+    `on_added(sheet_id)` is called as soon as each new sheet is stored, so
+    processing can start while the rest of the batch is still downloading.
     """
     gbif = gbif or GbifClient()
     http = http or httpx.Client(headers={"User-Agent": "herbarium-label-transcriber/0.1"})
@@ -224,6 +237,8 @@ def fetch_gbif_batch(
                 report.skipped.append({"key": key, "reason": f"download failed: {type(exc).__name__}"})
                 continue
             (report.added if created else report.existing).append(sheet.id)
+            if created and on_added is not None:
+                on_added(sheet.id)
         if body.get("endOfRecords", True) or not results:
             break
     return report
