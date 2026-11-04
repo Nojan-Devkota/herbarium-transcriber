@@ -1,0 +1,35 @@
+# Secrets — never commit real keys
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Runtime data (SQLite DB, images, crops, model-call cache)
+data/
+*.db
+*.sqlite3
+
+# Evaluation images are re-downloadable from GBIF; only the frozen jsonl sets are committed
+eval/images/
+eval/runs/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
