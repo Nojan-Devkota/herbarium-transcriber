@@ -23,7 +23,7 @@ def _configure_sqlite(dbapi_conn, _record) -> None:
     cur = dbapi_conn.cursor()
     cur.execute("PRAGMA journal_mode=WAL")
     cur.execute("PRAGMA foreign_keys=ON")
-    cur.execute("PRAGMA busy_timeout=5000")
+    cur.execute("PRAGMA busy_timeout=30000")
     cur.close()
 
 
@@ -33,7 +33,7 @@ def get_engine() -> Engine:
         settings = get_settings()
         _engine = create_engine(
             f"sqlite:///{settings.db_path}",
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False, "timeout": 30},
         )
         event.listen(_engine, "connect", _configure_sqlite)
         SQLModel.metadata.create_all(_engine)

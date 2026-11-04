@@ -88,7 +88,11 @@ def run_ablation(name: str, rows: list[dict[str, Any]], args: argparse.Namespace
     print(f"[{name}] processing {len(todo)}/{len(ids)} sheets with {args.workers} workers", file=sys.stderr)
 
     def work(sid: int) -> None:
-        sheet = process_sheet(sid, options=ABLATIONS[name])
+        try:
+            sheet = process_sheet(sid, options=ABLATIONS[name])
+        except Exception as exc:  # one bad sheet must not abort the whole evaluation
+            print(f"  [{name}] sheet {sid}: crashed {type(exc).__name__}: {exc}", file=sys.stderr)
+            return
         print(f"  [{name}] sheet {sid}: {sheet.status.value} ${sheet.cost_usd:.4f}", file=sys.stderr)
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:

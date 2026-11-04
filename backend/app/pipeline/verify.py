@@ -126,6 +126,7 @@ class Verifier:
     def _verify_name(self, f: Field, trace: Trace) -> None:
         rereads = 0
         while True:
+            self.ctx.release_db()
             try:
                 match = self.ctx.gbif.name_match(f.value or "")
             except httpx.HTTPError as exc:
@@ -212,6 +213,7 @@ class Verifier:
         trace.step = 100  # after the field's other checks
         state = by_term.get("municipality") or by_term.get("stateProvince")
         cc = next((d.value for d in self.derived if d.dwc_term == "countryCode"), None)
+        self.ctx.release_db()
         try:
             result = self.ctx.geocoder.geocode(loc.value or "", state.value if state else None, cc)  # type: ignore[union-attr]
         except httpx.HTTPError as exc:

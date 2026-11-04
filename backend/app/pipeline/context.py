@@ -107,6 +107,16 @@ class PipelineContext:
             )
         )
 
+    def release_db(self) -> None:
+        """End any open write transaction before slow network I/O.
+
+        SQLite allows one writer at a time; a session that autoflushed and then
+        waited 10+ s on a model call would block every other worker thread
+        ("database is locked"). Committing first keeps write locks short.
+        """
+        if self.session.in_transaction():
+            self.session.commit()
+
     def _key(self, stage: str, version: str, *extra: Any) -> str:
         # Client name is part of the key so mock output never pollutes the real cache.
         return cache_key(self.sheet_sha, stage, version, self.client.name, *extra)
@@ -118,6 +128,7 @@ class PipelineContext:
             usage = Usage.from_dict(hit["usage"])
             self.record("segment", usage, cached=True)
             return SegmentResult([Detection(**d) for d in hit["detections"]], hit["width"], hit["height"], usage)
+        self.release_db()
         result = self.client.segment(image_jpeg, concept)
         self.cache.set(
             "segment",
@@ -148,6 +159,7 @@ class PipelineContext:
             self.cache.set(req.stage, key, {"data": res.data.model_dump(), "usage": res.usage.to_dict()})
             return res.data, res.usage, False
 
+        self.release_db()
         if len(reqs) == 1:
             results = [compute(reqs[0])]
         else:
