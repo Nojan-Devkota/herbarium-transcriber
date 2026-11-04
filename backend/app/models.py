@@ -21,6 +21,7 @@ def utcnow() -> datetime:
 
 
 class SheetStatus(str, Enum):
+    uploaded = "uploaded"  # stored, not queued for processing
     queued = "queued"
     processing = "processing"
     done = "done"
