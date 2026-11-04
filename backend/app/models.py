@@ -38,7 +38,7 @@ class RegionKind(str, Enum):
 
     @property
     def has_text(self) -> bool:
-        return self in (RegionKind.label, RegionKind.slip, RegionKind.stamp, RegionKind.sheet)
+        return self in (RegionKind.label, RegionKind.slip, RegionKind.stamp, RegionKind.barcode, RegionKind.sheet)
 
 
 class FieldStatus(str, Enum):
