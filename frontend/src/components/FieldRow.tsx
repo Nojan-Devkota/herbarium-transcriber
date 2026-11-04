@@ -43,16 +43,23 @@ export default function FieldRow({ field, selected, onSelect, onReview }: Props)
   const [busy, setBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => setDraft(field.value ?? ""), [field.value]);
+  // Sync from the server only when not editing, so a refresh never wipes what the user is typing
+  useEffect(() => {
+    if (!editing) setDraft(field.value ?? "");
+  }, [field.value, editing]);
+  const [failed, setFailed] = useState<string>();
   useEffect(() => {
     if (editing) inputRef.current?.focus();
   }, [editing]);
 
   const run = async (action: "accept" | "edit", value?: string) => {
     setBusy(true);
+    setFailed(undefined);
     try {
       await onReview(action, value);
       setEditing(false);
+    } catch (e) {
+      setFailed(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
@@ -65,7 +72,14 @@ export default function FieldRow({ field, selected, onSelect, onReview }: Props)
     <li
       className={`field-row level-${field.confidence_level} ${selected ? "selected" : ""} ${reviewed ? "reviewed" : ""}`}
       onClick={onSelect}
-      aria-selected={selected}
+      onKeyDown={(e) => {
+        if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) {
+          e.preventDefault();
+          onSelect();
+        }
+      }}
+      tabIndex={0}
+      aria-current={selected ? "true" : undefined}
     >
       <div className="field-head">
         <span className="term" title={field.dwc_term}>
@@ -86,7 +100,14 @@ export default function FieldRow({ field, selected, onSelect, onReview }: Props)
           }}
           onClick={(e) => e.stopPropagation()}
         >
-          <input ref={inputRef} value={draft} onChange={(e) => setDraft(e.target.value)} disabled={busy} />
+          <input
+            ref={inputRef}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            disabled={busy}
+            maxLength={2000}
+            aria-label={`New value for ${termLabel(field.dwc_term)}`}
+          />
           <button type="submit" disabled={busy}>
             Save
           </button>
@@ -111,12 +132,17 @@ export default function FieldRow({ field, selected, onSelect, onReview }: Props)
         {changedByAgent && <span className="agent-fix">agent corrected from “{field.model_value}”</span>}
       </div>
 
+      {failed && (
+        <div className="field-error" role="alert">
+          Could not save: {failed}
+        </div>
+      )}
       {!editing && (
         <div className="field-actions" onClick={(e) => e.stopPropagation()}>
           <button disabled={busy || field.status === "accepted"} onClick={() => run("accept")} title="Accept (a)">
             ✓ Accept
           </button>
-          <button className="ghost" disabled={busy} onClick={() => setEditing(true)} title="Edit (e)">
+          <button className="ghost" disabled={busy} onClick={() => setEditing(true)}>
             Edit
           </button>
         </div>

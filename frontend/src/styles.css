@@ -226,9 +226,10 @@ select {
   box-shadow: 0 6px 18px rgba(40, 40, 20, 0.12);
 }
 .thumb {
+  display: block;
+  width: 100%;
   height: 220px;
-  background-size: cover;
-  background-position: center;
+  object-fit: cover;
   background-color: #ece6d6;
 }
 .sheet-card-body {
@@ -685,4 +686,15 @@ td {
   .left {
     position: static;
   }
+}
+
+.field-error {
+  grid-column: 1 / -1;
+  color: var(--low);
+  font-size: 0.8rem;
+}
+.field-row:focus-visible,
+.region:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }

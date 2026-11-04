@@ -11,10 +11,12 @@ const LICENSES = [
 
 export default function Upload() {
   const load = useCallback(() => api.listSheets(), []);
-  // Poll quickly only while a sheet is waiting or being processed
+  // Poll only while a sheet is waiting or being processed; when idle nothing can change
+  // except through this page, whose actions call refresh().
   const { data: sheets, error, refresh } = usePolling<SheetSummary[]>(load, (list) =>
-    list?.some((s) => s.status === "queued" || s.status === "processing") ? 3000 : 30000,
+    list?.some((s) => s.status === "queued" || s.status === "processing") ? 3000 : null,
   );
+  const [fileKey, setFileKey] = useState(0);
   const [files, setFiles] = useState<File[]>([]);
   const [license, setLicense] = useState("CC0_1_0");
   const [sourceUrl, setSourceUrl] = useState("");
@@ -34,6 +36,7 @@ export default function Upload() {
       const bad = res.filter((r) => r.error);
       setMessage(`Uploaded ${res.length - bad.length} sheet(s)` + (bad.length ? `; ${bad.map((b) => `${b.filename}: ${b.error}`).join(", ")}` : ""));
       setFiles([]);
+      setFileKey((k) => k + 1); // reset the file input so the same files can be chosen again
       refresh();
     } catch (e) {
       setMessage(String(e));
@@ -87,7 +90,7 @@ export default function Upload() {
         >
           <h2>Upload sheets</h2>
           <label className="file-pick">
-            <input type="file" accept="image/*" multiple onChange={(e) => setFiles(Array.from(e.target.files ?? []))} />
+            <input key={fileKey} type="file" accept="image/*" multiple onChange={(e) => setFiles(Array.from(e.target.files ?? []))} />
             <span>{files.length ? `${files.length} file(s) selected` : "Drop images here or click to choose"}</span>
           </label>
           <div className="row">
@@ -131,7 +134,13 @@ export default function Upload() {
             </label>
             <label>
               Sheets
-              <input type="number" min={1} max={50} value={limit} onChange={(e) => setLimit(Number(e.target.value))} />
+              <input
+                type="number"
+                min={1}
+                max={50}
+                value={limit}
+                onChange={(e) => setLimit(Math.min(50, Math.max(1, Number(e.target.value) || 1)))}
+              />
             </label>
           </div>
           <button disabled={busy || (!species && !dataset)} onClick={doGbif}>
@@ -140,8 +149,16 @@ export default function Upload() {
         </div>
       </div>
 
-      {message && <div className="notice">{message}</div>}
-      {error && <div className="error-box">API unreachable: {error}</div>}
+      {message && (
+        <div className="notice" role="status">
+          {message}
+        </div>
+      )}
+      {error && (
+        <div className="error-box" role="alert">
+          Could not load sheets: {error}
+        </div>
+      )}
 
       <h2>Sheets</h2>
       {!sheets?.length ? (
@@ -150,7 +167,7 @@ export default function Upload() {
         <div className="sheet-grid">
           {sheets.map((s) => (
             <a key={s.id} className="sheet-card" href={`#/sheets/${s.id}`}>
-              <div className="thumb" style={{ backgroundImage: `url(${api.imageUrl(s.id)})` }} />
+              <img className="thumb" src={api.imageUrl(s.id, "thumb")} alt="" loading="lazy" decoding="async" />
               <div className="sheet-card-body">
                 <strong>
                   <i>{s.scientific_name ?? s.filename ?? `Sheet ${s.id}`}</i>

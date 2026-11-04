@@ -23,9 +23,9 @@ function Bar({ parts }: { parts: { label: string; value: number; cls: string }[]
 export default function Batch() {
   const load = useCallback(() => api.stats(), []);
   const { data: s, error } = usePolling<Stats>(load, (st) =>
-    (st?.sheets_by_status.queued ?? 0) + (st?.sheets_by_status.processing ?? 0) > 0 ? 4000 : 30000,
+    (st?.sheets_by_status.queued ?? 0) + (st?.sheets_by_status.processing ?? 0) > 0 ? 4000 : null,
   );
-  if (error) return <div className="page error-box">{error}</div>;
+  if (error && !s) return <div className="page error-box" role="alert">{error}</div>;
   if (!s) return <div className="page muted">Loading…</div>;
 
   const done = s.sheets_by_status.done ?? 0;
@@ -34,6 +34,11 @@ export default function Batch() {
   return (
     <div className="page batch">
       <h1>Batch dashboard</h1>
+      {error && (
+        <div className="error-box" role="alert">
+          Showing the last numbers; refresh failed: {error}
+        </div>
+      )}
       <div className="stat-grid">
         <div className="stat">
           <span className="big">
