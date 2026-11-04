@@ -1,0 +1,170 @@
+"""End-to-end pipeline runs with the mock client and an offline GBIF."""
+
+from __future__ import annotations
+
+import httpx
+import pytest
+from sqlmodel import select
+
+from app.cache import Cache
+from app.clients.mock import MOCK_FIELDS, MockClient
+from app.models import Check, Field, ModelCall, Region, RegionKind, SheetStatus, Transcript
+from app.pipeline.context import RunOptions
+from app.pipeline.ingest import ingest_image
+from app.pipeline.run import process_sheet
+from app.tools.gbif import GbifClient
+
+
+def gbif_offline(settings, status="ACCEPTED", match_type="EXACT", accepted=None):
+    def handler(request: httpx.Request):
+        if request.url.path.endswith("/species/match"):
+            name = request.url.params["name"]
+            return httpx.Response(200, json={
+                "matchType": match_type, "confidence": 99, "status": status, "rank": "SPECIES",
+                "usageKey": 2650165, "scientificName": name, "family": "Ophioglossaceae",
+                "acceptedUsageKey": 42 if accepted else None,
+            })  # fmt: skip
+        return httpx.Response(200, json={"scientificName": accepted})
+
+    return GbifClient(http=httpx.Client(transport=httpx.MockTransport(handler)), cache=Cache(settings.cache_dir / "gbif-test"))
+
+
+@pytest.fixture
+def sheet_id(session, sheet_jpeg):
+    sheet, _ = ingest_image(session, sheet_jpeg, filename="demo.jpg", license="CC0_1_0")
+    return sheet.id
+
+
+def fields_by_term(session, sheet_id):
+    return {f.dwc_term: f for f in session.exec(select(Field).where(Field.sheet_id == sheet_id))}
+
+
+def test_full_pipeline_produces_grounded_verified_record(session, settings, sheet_id):
+    client = MockClient()
+    sheet = process_sheet(sheet_id, client=client, gbif=gbif_offline(settings))
+    assert sheet.status == SheetStatus.done, sheet.error
+
+    regions = session.exec(select(Region).where(Region.sheet_id == sheet_id)).all()
+    kinds = sorted(r.kind.value for r in regions)
+    assert kinds == ["label", "ruler", "slip"]
+    text_regions = sorted((r for r in regions if r.kind.has_text), key=lambda r: r.ordinal)
+    assert [r.ordinal for r in text_regions] == [1, 2] and text_regions[0].kind == RegionKind.slip  # slip is higher up
+    assert all(r.crop_path for r in text_regions)
+
+    fields = fields_by_term(session, sheet_id)
+    for term, verbatim, value in MOCK_FIELDS:
+        assert fields[term].value == value, term
+        assert fields[term].verbatim == verbatim
+        assert fields[term].span_start is not None
+    # Identification terms come from the later determination slip
+    slip = next(r for r in regions if r.kind == RegionKind.slip)
+    assert fields["scientificName"].region_id == slip.id
+    # Derived by tools
+    assert fields["countryCode"].value == "NO" and fields["countryCode"].derived
+    assert fields["taxonID"].value == "2650165"
+    # Verified fields are high confidence; every field has a trace
+    assert fields["scientificName"].confidence_level == "high"
+    assert fields["eventDate"].confidence_level == "high"
+    checks = session.exec(select(Check).where(Check.field_id == fields["scientificName"].id)).all()
+    assert {c.tool for c in checks} >= {"grounding", "gbif_name_match"}
+    assert sheet.cost_usd == 0.0
+
+
+def test_second_run_is_served_from_cache(session, settings, sheet_id):
+    process_sheet(sheet_id, client=MockClient(), gbif=gbif_offline(settings))
+    again = MockClient()
+    sheet = process_sheet(sheet_id, client=again, gbif=gbif_offline(settings))
+    assert sheet.status == SheetStatus.done
+    assert again.calls == []  # nothing reached the model
+    calls = session.exec(select(ModelCall).where(ModelCall.sheet_id == sheet_id)).all()
+    assert calls and all(c.cached for c in calls)
+    # Re-run replaced, not duplicated, the results
+    assert len(session.exec(select(Field).where(Field.sheet_id == sheet_id, Field.dwc_term == "eventDate")).all()) == 1
+
+
+def test_agent_rereads_and_fixes_misinterpreted_year(session, settings, sheet_id):
+    def interpret(prompt):
+        return {"fields": [{"term": "eventDate", "region": 2, "verbatim": "24. VII. 1897", "value": "1997-07-24"}]}
+
+    client = MockClient(overrides={"interpretout": interpret})
+    process_sheet(sheet_id, client=client, gbif=gbif_offline(settings))
+    f = fields_by_term(session, sheet_id)["eventDate"]
+    assert f.value == "1897-07-24" and f.model_value == "1997-07-24"
+    trace = session.exec(select(Check).where(Check.field_id == f.id).order_by(Check.step)).all()
+    assert [c.tool for c in trace][:4] == ["grounding", "date_check", "reread_crop", "date_check"]
+    assert trace[1].passed is False and trace[3].passed is True
+
+
+def test_reread_is_bounded_when_problem_persists(session, settings, sheet_id):
+    def interpret(prompt):
+        return {"fields": [{"term": "eventDate", "region": 2, "verbatim": "24. VII. 1897", "value": "2097-07-24"}]}
+
+    rereads = []
+
+    def reread(prompt):
+        rereads.append(prompt)
+        return {"answer": f"24. VII. 20{97 - len(rereads)}", "legible": True, "note": "keeps changing"}
+
+    client = MockClient(overrides={"interpretout": interpret, "rereadout": reread})
+    process_sheet(sheet_id, client=client, gbif=gbif_offline(settings))
+    assert len(rereads) <= settings.max_rereads_per_field
+
+
+def test_synonym_yields_accepted_name(session, settings, sheet_id):
+    gbif = gbif_offline(settings, status="SYNONYM", accepted="Botrychium accepted Sw.")
+    process_sheet(sheet_id, client=MockClient(), gbif=gbif)
+    fields = fields_by_term(session, sheet_id)
+    assert fields["acceptedNameUsage"].value == "Botrychium accepted Sw."
+    assert fields["scientificName"].value == "Botrychium lunaria (L.) Sw."  # label name is kept
+
+
+def test_unknown_name_triggers_targeted_reread(session, settings, sheet_id):
+    questions = []
+
+    def reread(prompt):
+        questions.append(prompt)
+        return {"answer": "Botrychium lunaria (L.) Sw.", "legible": True, "note": "same"}
+
+    gbif = gbif_offline(settings, match_type="NONE")
+    process_sheet(sheet_id, client=MockClient(overrides={"rereadout": reread}), gbif=gbif)
+    f = fields_by_term(session, sheet_id)["scientificName"]
+    assert len(questions) == 1 and "does not exactly recognise" in questions[0]
+    assert f.status.value == "flagged" and f.confidence_level != "high"
+
+
+def test_spark_locate_fallback_when_sam_finds_nothing(session, settings, sheet_id):
+    empty = {"boxes": []}
+    client = MockClient(overrides={"segment:label": empty, "segment:annotation slip": empty, "segment:ruler": empty})
+    process_sheet(sheet_id, client=client, gbif=gbif_offline(settings))
+    regions = session.exec(select(Region).where(Region.sheet_id == sheet_id)).all()
+    assert [r.source for r in regions] == ["spark"]
+    assert ("spark", "locateout") in client.calls
+
+
+def test_whole_sheet_ablation_skips_sam(session, settings, sheet_id):
+    client = MockClient()
+    opts = RunOptions(use_sam=False, use_verify=False, use_second_pass=False)
+    sheet = process_sheet(sheet_id, client=client, options=opts, gbif=gbif_offline(settings))
+    assert sheet.status == SheetStatus.done
+    regions = session.exec(select(Region).where(Region.sheet_id == sheet_id)).all()
+    assert [r.kind for r in regions] == [RegionKind.sheet]
+    assert not any(kind == "segment" for kind, _ in client.calls)
+    f = fields_by_term(session, sheet_id)["eventDate"]
+    tools = {c.tool for c in session.exec(select(Check).where(Check.field_id == f.id))}
+    assert tools == {"grounding"}
+
+
+def test_selective_second_pass_only_for_unverified_fields(session, settings, sheet_id):
+    process_sheet(sheet_id, client=MockClient(), gbif=gbif_offline(settings))
+    pass2 = session.exec(select(Transcript).where(Transcript.sheet_id == sheet_id, Transcript.pass_no == 2)).all()
+    assert pass2  # free-text fields (locality, recordedBy) need a second reading
+    f = fields_by_term(session, sheet_id)["locality"]
+    assert f.evidence["agreement"] == 1.0 and f.confidence_level == "high"
+
+
+def test_model_failure_marks_sheet_error_without_crashing(session, settings, sheet_id):
+    def boom(prompt):
+        raise RuntimeError("API down")
+
+    sheet = process_sheet(sheet_id, client=MockClient(overrides={"interpretout": boom}), gbif=gbif_offline(settings))
+    assert sheet.status == SheetStatus.error and "API down" in sheet.error

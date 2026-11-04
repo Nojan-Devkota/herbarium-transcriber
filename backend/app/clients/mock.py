@@ -108,7 +108,8 @@ class MockClient(LLMClient):
     @staticmethod
     def _transcribe(_prompt: str, images: list[bytes]) -> dict[str, Any]:
         w, h = Image.open(io.BytesIO(images[0])).size if images else (1, 1)
-        lines = MOCK_SLIP_LINES if w / max(h, 1) > 3.2 else MOCK_LABEL_LINES
+        # Slips are long and thin (aspect > 2 even after crop padding); labels are squarer
+        lines = MOCK_SLIP_LINES if w / max(h, 1) > 2.0 else MOCK_LABEL_LINES
         return {"lines": lines, "language": "la", "script": "printed"}
 
     @staticmethod
