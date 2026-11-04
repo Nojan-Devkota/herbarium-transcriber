@@ -11,7 +11,10 @@ const LICENSES = [
 
 export default function Upload() {
   const load = useCallback(() => api.listSheets(), []);
-  const { data: sheets, error, refresh } = usePolling<SheetSummary[]>(load, 3000);
+  // Poll quickly only while a sheet is waiting or being processed
+  const { data: sheets, error, refresh } = usePolling<SheetSummary[]>(load, (list) =>
+    list?.some((s) => s.status === "queued" || s.status === "processing") ? 3000 : 30000,
+  );
   const [files, setFiles] = useState<File[]>([]);
   const [license, setLicense] = useState("CC0_1_0");
   const [sourceUrl, setSourceUrl] = useState("");

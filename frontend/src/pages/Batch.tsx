@@ -22,7 +22,9 @@ function Bar({ parts }: { parts: { label: string; value: number; cls: string }[]
 
 export default function Batch() {
   const load = useCallback(() => api.stats(), []);
-  const { data: s, error } = usePolling<Stats>(load, 4000);
+  const { data: s, error } = usePolling<Stats>(load, (st) =>
+    (st?.sheets_by_status.queued ?? 0) + (st?.sheets_by_status.processing ?? 0) > 0 ? 4000 : 30000,
+  );
   if (error) return <div className="page error-box">{error}</div>;
   if (!s) return <div className="page muted">Loading…</div>;
 

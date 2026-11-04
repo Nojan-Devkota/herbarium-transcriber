@@ -132,3 +132,22 @@ def test_gbif_batch_needs_a_filter(client):
 def test_stats_on_empty_db(client):
     s = client.get("/stats").json()
     assert s["sheets_total"] == 0 and s["avg_cost_per_sheet_usd"] is None
+
+
+def test_polling_requests_are_kept_out_of_the_access_log():
+    import logging
+
+    from app.main import QuietPollingFilter
+
+    f = QuietPollingFilter()
+
+    def rec(method, path, status):
+        return logging.LogRecord("uvicorn.access", logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d',
+                                 ("127.0.0.1:1", method, path, "1.1", status), None)  # fmt: skip
+
+    assert not f.filter(rec("GET", "/sheets", 200))
+    assert not f.filter(rec("GET", "/sheets/12", 304))
+    assert not f.filter(rec("GET", "/stats", 200))
+    assert f.filter(rec("POST", "/sheets", 200))  # uploads stay visible
+    assert f.filter(rec("GET", "/sheets/12/image", 200))
+    assert f.filter(rec("GET", "/sheets", 500))  # errors stay visible

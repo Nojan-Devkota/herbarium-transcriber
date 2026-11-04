@@ -9,6 +9,8 @@ If the frontend has been built (frontend/dist), it is served at `/`.
 from __future__ import annotations
 
 import logging
+import os
+import re
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -39,9 +41,26 @@ ABLATIONS: dict[str, RunOptions] = {
 }
 
 
+_POLL_PATH = re.compile(r"^/(sheets(/\d+)?|stats|health)$")
+
+
+class QuietPollingFilter(logging.Filter):
+    """Drop successful GETs of the endpoints the UI polls, so the access log shows real activity."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 5:
+            method, path, status = args[1], str(args[2]).split("?")[0], args[4]
+            if method == "GET" and status in (200, 304) and _POLL_PATH.match(path):
+                return False
+        return True
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if os.environ.get("LOG_POLLING", "").lower() not in ("1", "true"):
+        logging.getLogger("uvicorn.access").addFilter(QuietPollingFilter())
     get_engine()
     worker.start()
     resumed = worker.resume_unfinished()

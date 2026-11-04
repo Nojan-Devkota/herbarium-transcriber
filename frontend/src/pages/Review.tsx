@@ -22,7 +22,8 @@ const STAGES = ["segment", "transcribe", "interpret", "verify", "confidence"];
 export default function Review({ sheetId }: { sheetId: number }) {
   const load = useCallback(() => api.getSheet(sheetId), [sheetId]);
   const [pollKey, setPollKey] = useState(0);
-  const { data, error, setData } = usePolling<SheetDetail>(load, 2000, (d) => !d || !isFinished(d.sheet.status), pollKey);
+  // Poll while the sheet is being processed; stop once it is done (restarted by Re-run)
+  const { data, error, setData } = usePolling<SheetDetail>(load, (d) => (d && isFinished(d.sheet.status) ? null : 2000), pollKey);
   const [selectedField, setSelectedField] = useState<number | null>(null);
   const [selectedRegion, setSelectedRegion] = useState<number | null>(null);
   const [filter, setFilter] = useState<"all" | "review">("all");
