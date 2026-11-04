@@ -1,0 +1,1 @@
+"""Herbarium Label Transcriber backend."""
