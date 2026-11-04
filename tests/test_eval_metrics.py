@@ -28,7 +28,8 @@ def test_date_correct_at_truth_precision():
 def test_name_correct_uses_accepted_taxon():
     keys = {"Arenaria stricta": {"usageKey": 1, "acceptedUsageKey": 2}, "Sabulina michauxii": {"usageKey": 2}}
     assert name_correct("Arenaria stricta", "Sabulina michauxii", keys.get)
-    assert not name_correct(None, "Sabulina michauxii", keys.get)
+    assert name_correct(None, "Sabulina michauxii", keys.get) is False
+    assert name_correct("x", "Unresolvable truth", lambda n: {}) is None  # unscorable, not wrong
 
 
 def test_text_metrics():
@@ -42,7 +43,7 @@ def test_score_sheet_skips_missing_truth_and_marks_missing_pred():
     rows = score_sheet(
         {"eventDate": {"value": "1950-06-12", "confidence_level": "high"}, "countryCode": {"value": "US"}},
         {"eventDate": "1950-06-12", "countryCode": "US", "recordedBy": "R. Sigafoos"},
-        lambda n: {},
+        lambda n: {"usageKey": 1},
     )
     by = {r["field"]: r for r in rows}
     assert by["eventDate"]["correct"] and by["country"]["correct"]

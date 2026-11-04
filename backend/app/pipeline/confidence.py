@@ -68,11 +68,15 @@ def score_field(field: Field, checks: list[Check], high: float, medium: float) -
         score = min(score, medium - 0.05)
     if ev.get("reread_changed"):
         score *= 0.9
+    if ev.get("verification_unavailable"):  # e.g. GBIF was down: the external check never ran
+        score = min(score, medium - 0.05)
     score = round(max(0.0, min(1.0, score)), 3)
     level = "high" if score >= high else "medium" if score >= medium else "low"
     components = {name: round(v, 3) for name, _, v in parts}
     if failed:
         components["failed_checks"] = failed
+    if ev.get("verification_unavailable"):
+        components["verification_unavailable"] = True
     return score, level, components
 
 

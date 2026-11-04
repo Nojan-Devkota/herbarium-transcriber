@@ -18,6 +18,7 @@ from typing import Any
 
 import httpx
 import pycountry
+from rapidfuzz import fuzz, process
 
 from app.cache import Cache
 
@@ -42,6 +43,12 @@ def _fold(s: str) -> str:
     return " ".join(s.lower().replace(":", " ").split()).strip(" .,;")
 
 
+_COUNTRY_NAMES: dict[str, str] = {}
+for _c in pycountry.countries:
+    for _n in {_c.name, getattr(_c, "common_name", _c.name), getattr(_c, "official_name", _c.name)}:
+        _COUNTRY_NAMES[_fold(_n)] = _c.alpha_2
+
+
 def country_lookup(name: str | None) -> dict[str, Any] | None:
     """Return {'code', 'name'} for a country as written, or None if unknown."""
     if not name or not name.strip():
@@ -53,14 +60,19 @@ def country_lookup(name: str | None) -> dict[str, Any] | None:
         try:
             country = pycountry.countries.lookup(name.strip())
         except LookupError:
-            try:
-                matches = pycountry.countries.search_fuzzy(folded)
-                country = matches[0] if matches else None
-            except LookupError:
-                country = None
+            country = _closest_country(folded)
     if country is None:
         return None
     return {"code": country.alpha_2, "name": getattr(country, "common_name", None) or country.name}
+
+
+def _closest_country(folded: str) -> Any:
+    """Close spelling match against country names only (pycountry's search_fuzzy also matches
+    subdivisions and accepts OCR garbage as a country)."""
+    if len(folded) < 5:
+        return None
+    best = process.extractOne(folded, list(_COUNTRY_NAMES), scorer=fuzz.ratio, score_cutoff=80)
+    return pycountry.countries.get(alpha_2=_COUNTRY_NAMES[best[0]]) if best else None
 
 
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

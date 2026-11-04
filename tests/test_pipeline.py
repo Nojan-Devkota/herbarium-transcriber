@@ -302,3 +302,28 @@ def test_stale_cache_entry_is_a_miss(session, settings, sheet_id):
     sheet = process_sheet(sheet_id, client=client, gbif=gbif_offline(settings))
     assert sheet.status == SheetStatus.done
     assert ("spark", "transcriptout") in client.calls  # re-fetched instead of crashing
+
+
+def test_gbif_outage_flags_the_name_instead_of_passing_it(session, settings, sheet_id):
+    def down(request):
+        raise httpx.ConnectError("GBIF down")
+
+    gbif = GbifClient(http=httpx.Client(transport=httpx.MockTransport(down)), cache=Cache(settings.cache_dir / "down"))
+    sheet = process_sheet(sheet_id, client=MockClient(), gbif=gbif)
+    assert sheet.status == SheetStatus.done
+    f = fields_by_term(session, sheet_id)["scientificName"]
+    assert f.evidence["verification_unavailable"] is True
+    assert f.status.value == "flagged" and f.confidence_level != "high"
+
+
+def test_failed_sheet_keeps_cost_of_calls_already_made(session, settings, sheet_id):
+    class FailsAtInterpret(MockClient):
+        def complete_json(self, prompt, images, schema, schema_name, effort):
+            if schema_name == "interpretout":
+                raise RuntimeError("API down")
+            raw, usage = super().complete_json(prompt, images, schema, schema_name, effort)
+            usage.cost_usd = 0.01
+            return raw, usage
+
+    sheet = process_sheet(sheet_id, client=FailsAtInterpret(), gbif=gbif_offline(settings))
+    assert sheet.status == SheetStatus.error and sheet.cost_usd > 0  # transcription was paid for

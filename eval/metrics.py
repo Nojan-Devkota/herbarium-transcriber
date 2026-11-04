@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import re
+import sys
 import unicodedata
 from collections.abc import Callable
 from typing import Any
@@ -71,11 +72,20 @@ def taxon_key(match: dict[str, Any]) -> int | None:
     return match.get("acceptedUsageKey") or match.get("usageKey")
 
 
-def name_correct(pred: str | None, truth: str | None, name_match: Callable[[str], dict[str, Any]]) -> bool:
-    if not pred or not truth:
-        return False
-    kp, kt = taxon_key(name_match(pred)), taxon_key(name_match(truth))
-    return kp is not None and kp == kt
+def name_correct(pred: str | None, truth: str | None, name_match: Callable[[str], dict[str, Any]]) -> bool | None:
+    """True/False, or None when GBIF can't resolve the *truth* name (unscorable, not wrong)."""
+    if not truth:
+        return None
+    try:
+        kt = taxon_key(name_match(truth))
+        if kt is None:
+            return None
+        if not pred:
+            return False
+        return taxon_key(name_match(pred)) == kt
+    except Exception as exc:  # noqa: BLE001 - a GBIF outage must not look like a model error
+        print(f"warning: could not score name {pred!r} vs {truth!r}: {exc}", file=sys.stderr)
+        return None
 
 
 def country_correct(pred_code: str | None, pred_name: str | None, truth_code: str | None) -> bool | None:
