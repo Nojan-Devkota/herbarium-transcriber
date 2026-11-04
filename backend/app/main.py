@@ -359,6 +359,23 @@ def stats(session: Session = Depends(get_session)) -> api.Stats:
 
 
 # --- built frontend (optional) ------------------------------------------------------------
-_DIST = Path(REPO_ROOT) / "frontend" / "dist"
-if _DIST.is_dir():
-    app.mount("/", StaticFiles(directory=_DIST, html=True), name="frontend")
+class FrontendFiles(StaticFiles):
+    """Serves the built UI. Vite fingerprints /assets/* by content hash, so those can be cached
+    forever; index.html must always be revalidated or browsers keep running an old build
+    (and request bundles that no longer exist) after an update."""
+
+    async def get_response(self, path: str, scope):  # type: ignore[override]
+        response = await super().get_response(path, scope)
+        if path.startswith("assets/") and response.status_code == 200:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+def mount_frontend(target: FastAPI, dist: Path) -> None:
+    if dist.is_dir():
+        target.mount("/", FrontendFiles(directory=dist, html=True), name="frontend")
+
+
+mount_frontend(app, Path(REPO_ROOT) / "frontend" / "dist")
