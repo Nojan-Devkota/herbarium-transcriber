@@ -128,10 +128,8 @@ def gbif_batch(req: api.GbifBatchRequest, session: Session = Depends(get_session
         taxon_key=req.taxon_key,
         year=req.year,
         limit=req.limit,
+        on_added=worker.enqueue if req.process else None,
     )
-    if req.process:
-        for sid in report.added:
-            worker.enqueue(sid)
     return api.GbifBatchResult(added=report.added, existing=report.existing, skipped=report.skipped)
 
 
