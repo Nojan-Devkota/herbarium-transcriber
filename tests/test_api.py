@@ -219,3 +219,20 @@ def test_sheet_list_query_count_does_not_grow_with_sheets(client, settings):
     finally:
         event.remove(get_engine(), "before_cursor_execute", listener)
     assert len([q for q in statements if q.lstrip().upper().startswith("SELECT")]) <= 3
+
+
+def test_built_ui_cache_headers(tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient as TC
+
+    from app.main import mount_frontend
+
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "index.html").write_text("<html>ui</html>")
+    (tmp_path / "assets" / "index-abc123.js").write_text("console.log(1)")
+    ui = FastAPI()
+    mount_frontend(ui, tmp_path)
+    c = TC(ui)
+    assert c.get("/").headers["cache-control"] == "no-cache"  # always revalidate the entry page
+    assert "immutable" in c.get("/assets/index-abc123.js").headers["cache-control"]
+    assert c.get("/assets/missing.js").status_code == 404
