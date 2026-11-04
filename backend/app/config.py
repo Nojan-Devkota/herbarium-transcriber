@@ -10,6 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -47,6 +48,8 @@ class Settings(BaseSettings):
 
     # --- Storage --------------------------------------------------------
     data_dir: Path = REPO_ROOT / "data"
+    # Optional separate cache location (the evaluation shares one cache across ablation runs)
+    cache_dir_override: Path | None = Field(default=None, validation_alias="CACHE_DIR")
 
     # --- Segmentation ---------------------------------------------------
     sam_max_side: int = 1600  # sheets are downscaled to this before SAM
@@ -79,7 +82,7 @@ class Settings(BaseSettings):
 
     @property
     def cache_dir(self) -> Path:
-        return self.data_dir / "cache"
+        return self.cache_dir_override or self.data_dir / "cache"
 
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.images_dir, self.crops_dir, self.cache_dir):

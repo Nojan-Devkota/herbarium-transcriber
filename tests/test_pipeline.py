@@ -168,3 +168,20 @@ def test_model_failure_marks_sheet_error_without_crashing(session, settings, she
 
     sheet = process_sheet(sheet_id, client=MockClient(overrides={"interpretout": boom}), gbif=gbif_offline(settings))
     assert sheet.status == SheetStatus.error and "API down" in sheet.error
+
+
+def test_cached_calls_keep_nominal_cost(session, settings, sheet_id):
+    priced = MockClient()
+    original = priced.complete_json
+
+    def with_cost(*args, **kwargs):
+        raw, usage = original(*args, **kwargs)
+        usage.cost_usd = 0.01
+        return raw, usage
+
+    priced.complete_json = with_cost
+    first = process_sheet(sheet_id, client=priced, gbif=gbif_offline(settings))
+    second = process_sheet(sheet_id, client=MockClient(), gbif=gbif_offline(settings))
+    assert first.cost_usd > 0 and second.cost_usd == 0
+    calls = session.exec(select(ModelCall).where(ModelCall.sheet_id == sheet_id)).all()
+    assert sum(c.nominal_cost_usd for c in calls) == pytest.approx(first.cost_usd)

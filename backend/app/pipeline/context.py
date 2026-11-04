@@ -102,6 +102,8 @@ class PipelineContext:
                 cost_usd=0.0 if cached else usage.cost_usd,
                 cached=cached,
                 latency_ms=0 if cached else usage.latency_ms,
+                nominal_cost_usd=usage.cost_usd,
+                nominal_latency_ms=usage.latency_ms,
             )
         )
 
