@@ -18,7 +18,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from sqlmodel import Session, select
 
 from app.config import Settings, get_settings
-from app.models import Sheet
+from app.models import Sheet, SheetStatus
 from app.tools.gbif import GbifClient
 
 log = logging.getLogger(__name__)
@@ -119,6 +119,7 @@ def ingest_image(
         license=normalize_license(license) if license else None,
         gbif_occurrence_id=gbif_occurrence_id,
         gbif_record=gbif_record,
+        status=SheetStatus.uploaded,
     )
     session.add(sheet)
     session.commit()
