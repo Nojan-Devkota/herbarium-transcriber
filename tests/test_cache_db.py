@@ -51,3 +51,11 @@ def test_models_roundtrip_with_json_columns(session):
     assert session.exec(select(Check)).one().result == {"ok": True}
     assert session.get(Sheet, sheet.id).gbif_record == {"a": 1}
     assert RegionKind.slip.has_text and not RegionKind.ruler.has_text
+
+
+def test_cache_dir_override(monkeypatch, tmp_path):
+    from app import config
+
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "shared-cache"))
+    config.get_settings.cache_clear()
+    assert config.get_settings().cache_dir == tmp_path / "shared-cache"

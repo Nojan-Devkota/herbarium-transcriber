@@ -168,3 +168,54 @@ def test_model_failure_marks_sheet_error_without_crashing(session, settings, she
 
     sheet = process_sheet(sheet_id, client=MockClient(overrides={"interpretout": boom}), gbif=gbif_offline(settings))
     assert sheet.status == SheetStatus.error and "API down" in sheet.error
+
+
+def test_cached_calls_keep_nominal_cost(session, settings, sheet_id):
+    priced = MockClient()
+    original = priced.complete_json
+
+    def with_cost(*args, **kwargs):
+        raw, usage = original(*args, **kwargs)
+        usage.cost_usd = 0.01
+        return raw, usage
+
+    priced.complete_json = with_cost
+    first = process_sheet(sheet_id, client=priced, gbif=gbif_offline(settings))
+    second = process_sheet(sheet_id, client=MockClient(), gbif=gbif_offline(settings))
+    assert first.cost_usd > 0 and second.cost_usd == 0
+    calls = session.exec(select(ModelCall).where(ModelCall.sheet_id == sheet_id)).all()
+    assert sum(c.nominal_cost_usd for c in calls) == pytest.approx(first.cost_usd)
+
+
+def test_no_write_lock_is_held_during_model_calls(session, settings, sheet_id):
+    """Regression: concurrent eval workers hit 'database is locked' because a session
+    held a write transaction open across slow model calls."""
+    import sqlite3
+
+    violations = []
+
+    def assert_db_writable():
+        con = sqlite3.connect(settings.db_path, timeout=0)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.rollback()
+        except sqlite3.OperationalError as exc:
+            violations.append(str(exc))
+        finally:
+            con.close()
+
+    class LockCheckingClient(MockClient):
+        def segment(self, image_jpeg, concept):
+            assert_db_writable()
+            return super().segment(image_jpeg, concept)
+
+        def complete_json(self, *args, **kwargs):
+            assert_db_writable()
+            return super().complete_json(*args, **kwargs)
+
+    gbif = gbif_offline(settings, match_type="NONE")  # forces re-reads, the path that held locks
+    original = gbif.name_match
+    gbif.name_match = lambda *a, **k: (assert_db_writable(), original(*a, **k))[1]
+    sheet = process_sheet(sheet_id, client=LockCheckingClient(), gbif=gbif)
+    assert sheet.status == SheetStatus.done
+    assert violations == []

@@ -150,4 +150,8 @@ class ModelCall(SQLModel, table=True):
     cost_usd: float = 0.0
     cached: bool = False
     latency_ms: int = 0
+    # What the call cost / took when it was originally made (same as above unless cached);
+    # lets the evaluation report true cost per sheet even when replaying from cache.
+    nominal_cost_usd: float = 0.0
+    nominal_latency_ms: int = 0
     created_at: datetime = Col(default_factory=utcnow)
